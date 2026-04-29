@@ -301,11 +301,14 @@ def _extract_henex_summary_sheet(rows: list[list[Any]], prefix: str) -> dict[int
             mtu_columns.append((column_index, mtu))
     if not mtu_columns:
         return {}
+    interval_minutes = 15 if max(mtu for _, mtu in mtu_columns) > 24 else 60
 
     price_row_index = _find_henex_price_row(rows)
     result: dict[int, dict[str, Any]] = {}
     for column_index, mtu in mtu_columns:
-        timestamp = datetime.combine(delivery_date, time()) + timedelta(minutes=15 * (mtu - 1))
+        timestamp = datetime.combine(delivery_date, time()) + timedelta(
+            minutes=interval_minutes * (mtu - 1)
+        )
         result[mtu] = {"timestamp": timestamp.isoformat()}
         if price_row_index is not None:
             price = _safe_float_cell(_cell(rows[price_row_index], column_index))

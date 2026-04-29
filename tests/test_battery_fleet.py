@@ -17,6 +17,28 @@ def test_aggregate_multiple_batteries():
     assert fleet.battery_count == 2
 
 
+def test_accepts_user_facing_battery_fields():
+    spec = BatterySpec.from_dict(
+        {
+            "name": "A",
+            "max_capacity": 20,
+            "min_capacity": 4,
+            "effieciency": 0.92,
+            "availability": 95,
+            "ramp": 8,
+        }
+    )
+
+    fleet = aggregate_fleet([spec])
+
+    assert fleet.capacity_mwh == 20
+    assert fleet.min_soc_mwh == pytest.approx(4)
+    assert fleet.round_trip_efficiency == pytest.approx(0.92)
+    assert fleet.availability_pct == 95
+    assert fleet.ramp_mw == pytest.approx(7.6)
+    assert fleet.power_mw == pytest.approx(7.6)
+
+
 def test_invalid_battery_rejected():
-    with pytest.raises(ValueError, match="capacity_mwh"):
+    with pytest.raises(ValueError, match="capacity"):
         aggregate_fleet([BatterySpec("Bad", capacity_mwh=0, power_mw=10)])
