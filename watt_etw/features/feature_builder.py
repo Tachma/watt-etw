@@ -1,5 +1,9 @@
 """Build the feature matrix by joining HENEX prices, TTF gas, and weather.
 
+weather_df can be the single-location output of weather_fetcher.fetch, or a
+technology-level RES weather table from weather_fetcher.fetch_renewable_weather_features.
+Extra weather columns are preserved after the date/hour merge.
+
 Output schema (one row per date-hour):
     date, hour
     -- price history (lags & rolling stats on MCP) --
