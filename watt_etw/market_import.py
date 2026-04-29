@@ -194,7 +194,15 @@ def _read_csv(content: bytes) -> list[dict[str, Any]]:
 def _read_xlsx(content: bytes) -> list[dict[str, Any]]:
     with zipfile.ZipFile(io.BytesIO(content)) as archive:
         shared = _read_shared_strings(archive)
-        sheet_names = [name for name in archive.namelist() if name.startswith("xl/worksheets/sheet") and name.endswith(".xml")]
+        sheet_names = [
+            name
+            for name in archive.namelist()
+            if name.startswith("xl/worksheets/sheet") and name.endswith(".xml")
+        ]
+        sheet_prefixes = _xlsx_sheet_prefixes(archive)
+        henex_rows = _read_henex_summary_workbook(archive, sheet_names, shared, sheet_prefixes)
+        if henex_rows:
+            return henex_rows
         for sheet_name in sheet_names:
             rows = _sheet_rows(archive.read(sheet_name), shared)
             table = _rows_to_dicts(rows)
@@ -230,6 +238,158 @@ def _sheet_rows(xml: bytes, shared: list[str]) -> list[list[Any]]:
             values.append(value)
         rows.append(values)
     return rows
+
+
+def _read_henex_summary_workbook(
+    archive: zipfile.ZipFile,
+    sheet_names: list[str],
+    shared: list[str],
+    sheet_prefixes: dict[str, str],
+) -> list[dict[str, Any]]:
+    combined: dict[int, dict[str, Any]] = {}
+    for sheet_name in sheet_names:
+        rows = _sheet_rows(archive.read(sheet_name), shared)
+        prefix = sheet_prefixes.get(sheet_name, "market")
+        sheet_data = _extract_henex_summary_sheet(rows, prefix)
+        for mtu, values in sheet_data.items():
+            combined.setdefault(mtu, {}).update(values)
+    return [combined[index] for index in sorted(combined)]
+
+
+def _xlsx_sheet_prefixes(archive: zipfile.ZipFile) -> dict[str, str]:
+    try:
+        workbook = ElementTree.fromstring(archive.read("xl/workbook.xml"))
+        rels = ElementTree.fromstring(archive.read("xl/_rels/workbook.xml.rels"))
+    except KeyError:
+        return {}
+
+    rel_targets = {rel.attrib["Id"]: rel.attrib["Target"] for rel in rels}
+    prefixes: dict[str, str] = {}
+    for sheet in workbook.findall(".//{*}sheet"):
+        sheet_name = sheet.attrib.get("name", "").lower()
+        rel_id = sheet.attrib.get(
+            "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"
+        )
+        target = rel_targets.get(rel_id or "")
+        if not target or target.startswith("../"):
+            continue
+        path = f"xl/{target}" if not target.startswith("xl/") else target
+        if not path.startswith("xl/worksheets/"):
+            continue
+        if "sell" in sheet_name:
+            prefixes[path] = "sell"
+        elif "buy" in sheet_name:
+            prefixes[path] = "buy"
+        elif "coupling" in sheet_name:
+            prefixes[path] = "coupling"
+        else:
+            prefixes[path] = "market"
+    return prefixes
+
+
+def _extract_henex_summary_sheet(rows: list[list[Any]], prefix: str) -> dict[int, dict[str, Any]]:
+    time_row_index = _find_henex_time_row(rows)
+    if time_row_index is None:
+        return {}
+
+    time_row = rows[time_row_index]
+    delivery_date = _parse_excel_or_text_date(time_row[0])
+    mtu_columns: list[tuple[int, int]] = []
+    for column_index, value in enumerate(time_row[1:], start=1):
+        mtu = _parse_int_like(value)
+        if mtu is not None and 1 <= mtu <= 96:
+            mtu_columns.append((column_index, mtu))
+    if not mtu_columns:
+        return {}
+
+    price_row_index = _find_henex_price_row(rows)
+    result: dict[int, dict[str, Any]] = {}
+    for column_index, mtu in mtu_columns:
+        timestamp = datetime.combine(delivery_date, time()) + timedelta(minutes=15 * (mtu - 1))
+        result[mtu] = {"timestamp": timestamp.isoformat()}
+        if price_row_index is not None:
+            price = _safe_float_cell(_cell(rows[price_row_index], column_index))
+            if price is not None:
+                result[mtu]["price_eur_mwh"] = price
+
+    for row in rows:
+        label = str(_cell(row, 0) or "").strip()
+        if not label or label.lower() in {"market clearing price", "production technology / mtu"}:
+            continue
+        if _safe_float_cell(label) is not None:
+            continue
+        key = _henex_extra_key(prefix, label)
+        if key in {"sell_greece_mainland_15min_mcp", "buy_greece_mainland_15min_mcp", "coupling_greece_mainland_15min_mcp"}:
+            continue
+        for column_index, mtu in mtu_columns:
+            value = _safe_float_cell(_cell(row, column_index))
+            if value is not None:
+                result[mtu][key] = value
+
+    return {
+        mtu: values
+        for mtu, values in result.items()
+        if "price_eur_mwh" in values and "timestamp" in values
+    }
+
+
+def _find_henex_time_row(rows: list[list[Any]]) -> int | None:
+    for index, row in enumerate(rows[:12]):
+        if len(row) < 5:
+            continue
+        mtu_values = [_parse_int_like(value) for value in row[1:9]]
+        if mtu_values[:4] == [1, 2, 3, 4]:
+            return index
+    return None
+
+
+def _find_henex_price_row(rows: list[list[Any]]) -> int | None:
+    for index, row in enumerate(rows):
+        label = str(_cell(row, 0) or "").lower()
+        if "15min" in label and "mcp" in label:
+            return index
+    for index, row in enumerate(rows):
+        label = str(_cell(row, 0) or "").lower()
+        if "market clearing price" in label:
+            next_index = index + 1
+            if next_index < len(rows):
+                return next_index
+    return None
+
+
+def _parse_excel_or_text_date(value: Any) -> date:
+    number = _safe_float_cell(value)
+    if number is not None:
+        return (datetime(1899, 12, 30) + timedelta(days=number)).date()
+    return _parse_date(value)
+
+
+def _parse_int_like(value: Any) -> int | None:
+    number = _safe_float_cell(value)
+    if number is None:
+        return None
+    rounded = round(number)
+    if abs(number - rounded) < 1e-9:
+        return int(rounded)
+    return None
+
+
+def _safe_float_cell(value: Any) -> float | None:
+    if value in (None, ""):
+        return None
+    try:
+        return _parse_float(value)
+    except Exception:
+        return None
+
+
+def _cell(row: list[Any], index: int) -> Any:
+    return row[index] if index < len(row) else ""
+
+
+def _henex_extra_key(prefix: str, label: str) -> str:
+    cleaned = re.sub(r"[^a-z0-9]+", "_", label.lower()).strip("_")
+    return f"{prefix}_{cleaned}"
 
 
 def _rows_to_dicts(rows: list[list[Any]]) -> list[dict[str, Any]]:

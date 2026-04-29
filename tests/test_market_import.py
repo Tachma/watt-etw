@@ -1,4 +1,7 @@
 from watt_etw.market_import import load_market_file
+from pathlib import Path
+
+import pytest
 
 
 def test_accepts_csv_with_timestamp_and_price():
@@ -52,3 +55,22 @@ def test_detects_missing_intervals():
 
     assert result.valid
     assert any("missing" in warning for warning in result.warnings)
+
+
+def test_accepts_real_henex_results_summary_workbook_when_available():
+    path = Path("/Users/tachmamac/Downloads/20260429_EL-DAM_ResultsSummary_EN_v01.xlsx")
+    if not path.exists():
+        pytest.skip("Real HEnEx workbook is not available on this machine")
+
+    result = load_market_file(path.name, path.read_bytes())
+
+    assert result.valid
+    assert result.detected_dates == ["2026-04-29"]
+    assert result.interval_minutes == 15
+    assert result.row_count == 96
+    assert result.rows[0].price_eur_mwh == 157.04
+    assert result.rows[0].extra["sell_lignite"] == 799
+    assert result.rows[0].extra["sell_gas"] == 2505.902
+    assert result.rows[0].extra["sell_hydro"] == 325
+    assert result.rows[0].extra["sell_renewables"] == 809.191
+    assert result.rows[40].extra["buy_bess"] == 52
