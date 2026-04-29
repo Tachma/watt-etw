@@ -154,6 +154,7 @@ def build(
     admie_df: pd.DataFrame | None = None,
     res_weather_df: pd.DataFrame | None = None,
     carbon_df: pd.DataFrame | None = None,
+    outages_df: pd.DataFrame | None = None,
     cache_path: str | Path | None = "data/processed/features.parquet",
 ) -> pd.DataFrame:
     """Join all sources at 15-min resolution and engineer features.
@@ -265,6 +266,24 @@ def build(
         df = df.merge(carbon, on="date", how="left")
 
     # ------------------------------------------------------------------ #
+    # 6a. ENTSO-E outages (per-MTU MW unavailable)                         #
+    # ------------------------------------------------------------------ #
+    if outages_df is not None and not outages_df.empty:
+        out = outages_df.copy()
+        out["date"] = pd.to_datetime(out["date"])
+        keep_cols = ["date", "mtu",
+                     "mw_unavailable_planned", "mw_unavailable_forced"]
+        keep_cols = [c for c in keep_cols if c in out.columns]
+        df = df.merge(out[keep_cols], on=["date", "mtu"], how="left")
+        for c in ("mw_unavailable_planned", "mw_unavailable_forced"):
+            if c in df.columns:
+                df[c] = df[c].fillna(0.0)
+        if {"mw_unavailable_planned", "mw_unavailable_forced"}.issubset(df.columns):
+            df["mw_unavailable_total"] = (
+                df["mw_unavailable_planned"] + df["mw_unavailable_forced"]
+            )
+
+    # ------------------------------------------------------------------ #
     # 6b. Peak-hour helper features                                        #
     # ------------------------------------------------------------------ #
     df = _add_peak_features(df)
@@ -285,6 +304,7 @@ def build(
         "eua_eur_t", "eua_lag1d", "eua_lag7d",
         "load_forecast_mw", "res_forecast_mw",
         "net_load_forecast_mw", "load_res_ratio",
+        "mw_unavailable_planned", "mw_unavailable_forced", "mw_unavailable_total",
         "temp_dev_from_climatology", "net_load_vs_daily_max", "mcp_range_24h",
         "mcp_eur_mwh",
     ]
@@ -316,6 +336,7 @@ def load_or_build(
     admie_df: pd.DataFrame | None = None,
     res_weather_df: pd.DataFrame | None = None,
     carbon_df: pd.DataFrame | None = None,
+    outages_df: pd.DataFrame | None = None,
     cache_path: str | Path = "data/processed/features.parquet",
     force: bool = False,
 ) -> pd.DataFrame:
@@ -331,5 +352,6 @@ def load_or_build(
         admie_df=admie_df,
         res_weather_df=res_weather_df,
         carbon_df=carbon_df,
+        outages_df=outages_df,
         cache_path=cache_path,
     )

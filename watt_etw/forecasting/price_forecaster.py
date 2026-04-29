@@ -53,6 +53,8 @@ _CORE_FEATURES = [
     # ADMIE forecasts
     "load_forecast_mw", "res_forecast_mw",
     "net_load_forecast_mw", "load_res_ratio",
+    # ENTSO-E outage proxies (planned + forced unavailable MW)
+    "mw_unavailable_planned", "mw_unavailable_forced", "mw_unavailable_total",
     # Peak-hour helpers
     "temp_dev_from_climatology", "net_load_vs_daily_max", "mcp_range_24h",
 ]
