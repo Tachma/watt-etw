@@ -10,7 +10,7 @@ from pydantic import BaseModel
 
 from watt_etw.battery_fleet import BatterySpec, aggregate_fleet
 from watt_etw.market_import import filter_rows_for_date, load_market_file, rows_from_payload
-from watt_etw.optimizer import optimize_schedule
+from watt_etw.optimizer import NUM_INTERVALS, optimize_adjustments
 
 
 app = FastAPI(title="Watt ETW Battery Optimizer")
@@ -51,7 +51,9 @@ def optimize(payload: OptimizeRequest) -> dict:
         specs = [BatterySpec.from_dict(item) for item in payload.batteries]
         fleet = aggregate_fleet(specs)
         rows = filter_rows_for_date(rows_from_payload(payload.market_rows), payload.selected_date)
-        result = optimize_schedule(rows, fleet)
+        # Extract the 96 λ prices and max capacity before passing to the pure model
+        prices = [row.price_eur_mwh for row in rows[:NUM_INTERVALS]]
+        result = optimize_adjustments(prices, fleet.power_mw)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return result.to_dict()
@@ -61,14 +63,12 @@ def optimize(payload: OptimizeRequest) -> dict:
 def export_schedule(payload: ExportRequest) -> StreamingResponse:
     output = io.StringIO()
     fieldnames = [
-        "timestamp",
-        "price_eur_mwh",
-        "action",
-        "charge_mw",
-        "discharge_mw",
-        "soc_mwh",
-        "interval_hours",
-        "explanation",
+        "scenario",
+        "hour",
+        "price_coefficient",
+        "reference_dispatch_mw",
+        "adjusted_quantity_mw",
+        "obj_contribution",
     ]
     writer = csv.DictWriter(output, fieldnames=fieldnames)
     writer.writeheader()

@@ -1,34 +1,39 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from math import sqrt
-from statistics import mean
 
-from watt_etw.battery_fleet import AggregatedFleet
-from watt_etw.explanations import explain_action
-from watt_etw.market_import import MarketRow
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
 
+NUM_SCENARIOS: int = 4   # s ∈ {1, 2, 3, 4}  — quarter-hours within an hour
+NUM_HOURS: int = 24      # h ∈ {1, …, 24}
+NUM_INTERVALS: int = NUM_SCENARIOS * NUM_HOURS  # 96 λ values per day
+
+
+# ---------------------------------------------------------------------------
+# Output types
+# ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
-class ScheduleRow:
-    timestamp: str
-    price_eur_mwh: float
-    action: str
-    charge_mw: float
-    discharge_mw: float
-    soc_mwh: float
-    interval_hours: float
-    explanation: str
+class AdjustmentRow:
+    """Optimal solution for one (scenario, hour) cell."""
+    scenario: int                 # s ∈ {1, 2, 3, 4}  — quarter within the hour
+    hour: int                     # h ∈ {1, …, 24}
+    price_coefficient: float      # a_{s,h} = λ_{h,s}  (EUR/MWh)
+    reference_dispatch_mw: float  # d_{s,h}  — DAM committed quantity (MW)
+    adjusted_quantity_mw: float   # q_{s,h}  — optimal adjustment quantity (MW)
+    obj_contribution: float       # a_{s,h} · (d_{s,h} − q_{s,h})
 
     def to_dict(self) -> dict:
         return asdict(self)
 
 
 @dataclass(frozen=True)
-class OptimizationResult:
+class AdjustmentResult:
     status: str
     kpis: dict[str, float]
-    schedule: list[ScheduleRow]
+    schedule: list[AdjustmentRow]
 
     def to_dict(self) -> dict:
         return {
@@ -38,180 +43,139 @@ class OptimizationResult:
         }
 
 
-def optimize_schedule(rows: list[MarketRow], fleet: AggregatedFleet) -> OptimizationResult:
-    if len(rows) < 2:
-        raise ValueError("At least two market intervals are required")
-    interval_hours = _interval_hours(rows)
-    if interval_hours <= 0:
-        raise ValueError("Could not determine a positive market interval")
+# ---------------------------------------------------------------------------
+# Quantity Adjustment Model  (pure mathematics — no domain objects)
+# ---------------------------------------------------------------------------
 
-    prices = [row.price_eur_mwh for row in rows]
-    low_threshold, high_threshold = _price_thresholds(prices, fleet)
-    charge_eff = sqrt(fleet.round_trip_efficiency)
-    discharge_eff = sqrt(fleet.round_trip_efficiency)
+def optimize_adjustments(
+    prices: list[float],
+    max_capacity: float,
+    reference_dispatch: list[list[float]] | None = None,
+) -> AdjustmentResult:
+    """
+    Quantity Adjustment Model for the Greek Adjustment / Balancing Market.
 
-    soc = fleet.initial_soc_mwh
-    schedule: list[ScheduleRow] = []
-    charge_cost = 0.0
-    discharge_revenue = 0.0
-    charged_mwh = 0.0
-    discharged_mwh = 0.0
-    throughput_mwh = 0.0
+    Solves:
 
-    max_throughput = (
-        None
-        if fleet.max_cycles_per_day is None
-        else fleet.max_cycles_per_day * 2 * fleet.capacity_mwh
-    )
+        max   Σ_{h=1}^{24} Σ_{s=1}^{4}  a_{s,h} · (d_{s,h} − q_{s,h})
 
-    for index, row in enumerate(rows):
-        future_prices = prices[index + 1 :]
-        future_max = max(future_prices) if future_prices else row.price_eur_mwh
-        future_min = min(future_prices) if future_prices else row.price_eur_mwh
+    subject to:
 
-        action = "idle"
-        charge_mw = 0.0
-        discharge_mw = 0.0
-        current_throughput_room = None if max_throughput is None else max(0.0, max_throughput - throughput_mwh)
+        (1)  d_{s,h} · q_{s,h}  = 0            ∀ (s, h)   [complementarity]
+        (2)  q_{s,h}  ≤  Max_Capacity · 0.8    ∀ (s, h)   [upper op. bound]
+        (3)  q_{s,h}  ≥  Max_Capacity · 0.2    ∀ (s, h)   [lower op. bound]
 
-        profitable_charge = (
-            row.price_eur_mwh <= low_threshold
-            and future_max * discharge_eff * charge_eff
-            > row.price_eur_mwh + fleet.degradation_cost_eur_mwh
+    Parameters
+    ----------
+    prices:
+        96 market prices λ_{h,s} (EUR/MWh), one per 15-minute interval,
+        ordered chronologically: index = (h − 1) · 4 + (s − 1).
+
+        Example layout:
+            prices[0]  = λ_{1,1}  (hour 1, quarter 1: 00:00–00:15)
+            prices[1]  = λ_{1,2}  (hour 1, quarter 2: 00:15–00:30)
+            prices[2]  = λ_{1,3}  (hour 1, quarter 3: 00:30–00:45)
+            prices[3]  = λ_{1,4}  (hour 1, quarter 4: 00:45–01:00)
+            prices[4]  = λ_{2,1}  (hour 2, quarter 1: 01:00–01:15)
+            ...
+            prices[95] = λ_{24,4} (hour 24, quarter 4: 23:45–00:00)
+
+    max_capacity:
+        Max_Capacity (MW) — operational dispatch ceiling of the battery.
+
+    reference_dispatch:
+        Optional (4 × 24) matrix of DAM committed quantities in MW.
+        ``reference_dispatch[s][h]`` = d_{s,h}.
+        Defaults to all-zero (battery fully available for adjustment market).
+
+    Returns
+    -------
+    AdjustmentResult
+        Optimal q_{s,h} for every (s, h) pair together with KPIs.
+
+    Notes
+    -----
+    The LP decomposes into 96 independent scalar sub-problems (separable
+    box-constrained) each solved in O(1):
+
+        · d_{s,h} ≠ 0  →  q_{s,h} = 0      (complementarity, Constraint 1)
+        · a_{s,h} > 0  →  q_{s,h} = q_min  (Constraint 3 active)
+        · a_{s,h} < 0  →  q_{s,h} = q_max  (Constraint 2 active)
+        · a_{s,h} = 0  →  q_{s,h} = midpoint (objective insensitive)
+    """
+    if len(prices) != NUM_INTERVALS:
+        raise ValueError(
+            f"Expected {NUM_INTERVALS} prices (4 quarters × 24 hours), "
+            f"got {len(prices)}"
         )
-        profitable_discharge = row.price_eur_mwh >= high_threshold or (
-            row.price_eur_mwh > future_min + fleet.degradation_cost_eur_mwh
-            and soc > fleet.initial_soc_mwh
-        )
+    if max_capacity <= 0:
+        raise ValueError("max_capacity must be positive")
 
-        if profitable_discharge and soc > fleet.min_soc_mwh + 1e-9:
-            available_mwh = (soc - fleet.min_soc_mwh) * discharge_eff
-            discharge_energy = min(fleet.power_mw * interval_hours, available_mwh)
-            if current_throughput_room is not None:
-                discharge_energy = min(discharge_energy, current_throughput_room)
-            if discharge_energy > 1e-9:
-                action = "discharge"
-                discharge_mw = discharge_energy / interval_hours
-                soc -= discharge_energy / discharge_eff
-                discharge_revenue += discharge_energy * row.price_eur_mwh
-                discharged_mwh += discharge_energy
-                throughput_mwh += discharge_energy
-        elif profitable_charge and soc < fleet.max_soc_mwh - 1e-9:
-            capacity_room_input = (fleet.max_soc_mwh - soc) / charge_eff
-            charge_energy = min(fleet.power_mw * interval_hours, capacity_room_input)
-            if current_throughput_room is not None:
-                charge_energy = min(charge_energy, current_throughput_room)
-            if charge_energy > 1e-9:
-                action = "charge"
-                charge_mw = charge_energy / interval_hours
-                soc += charge_energy * charge_eff
-                charge_cost += charge_energy * row.price_eur_mwh
-                charged_mwh += charge_energy
-                throughput_mwh += charge_energy
+    q_min = max_capacity * 0.2
+    q_max = max_capacity * 0.8
+    q_mid = (q_min + q_max) / 2.0
 
-        explanation = explain_action(
-            action,
-            row.price_eur_mwh,
-            low_threshold,
-            high_threshold,
-            soc,
-            fleet.min_soc_mwh,
-            fleet.max_soc_mwh,
-        )
-        schedule.append(
-            ScheduleRow(
-                timestamp=row.timestamp.isoformat(),
-                price_eur_mwh=round(row.price_eur_mwh, 4),
-                action=action,
-                charge_mw=round(charge_mw, 4),
-                discharge_mw=round(discharge_mw, 4),
-                soc_mwh=round(soc, 4),
-                interval_hours=interval_hours,
-                explanation=explanation,
+    # Validate / default reference-dispatch matrix  d[s][h]  (0-indexed)
+    if reference_dispatch is None:
+        d: list[list[float]] = [[0.0] * NUM_HOURS for _ in range(NUM_SCENARIOS)]
+    else:
+        if (
+            len(reference_dispatch) != NUM_SCENARIOS
+            or any(len(row) != NUM_HOURS for row in reference_dispatch)
+        ):
+            raise ValueError(
+                f"reference_dispatch must be a "
+                f"{NUM_SCENARIOS}×{NUM_HOURS} matrix"
             )
-        )
+        d = [list(reference_dispatch[s]) for s in range(NUM_SCENARIOS)]
 
-    # Preserve the default final SOC by buying back energy if the heuristic finishes short.
-    if soc < fleet.initial_soc_mwh - 1e-6:
-        schedule, charge_cost, charged_mwh, throughput_mwh, soc = _restore_final_soc(
-            schedule,
-            rows,
-            fleet,
-            soc,
-            charge_eff,
-            charge_cost,
-            charged_mwh,
-            throughput_mwh,
-        )
+    # --- Solve the LP analytically (96 independent scalar problems) ---------
+    schedule: list[AdjustmentRow] = []
+    total_objective = 0.0
+    scenario_objectives = [0.0] * NUM_SCENARIOS
 
-    degradation_cost = throughput_mwh * fleet.degradation_cost_eur_mwh
-    net_profit = discharge_revenue - charge_cost - degradation_cost
-    kpis = {
-        "expected_profit": round(net_profit, 2),
-        "discharge_revenue": round(discharge_revenue, 2),
-        "charging_cost": round(charge_cost, 2),
-        "degradation_cost": round(degradation_cost, 2),
-        "charged_mwh": round(charged_mwh, 4),
-        "discharged_mwh": round(discharged_mwh, 4),
-        "average_buy_price": round(charge_cost / charged_mwh, 2) if charged_mwh else 0.0,
-        "average_sell_price": round(discharge_revenue / discharged_mwh, 2) if discharged_mwh else 0.0,
-        "equivalent_cycles": round(throughput_mwh / (2 * fleet.capacity_mwh), 4),
-        "final_soc_mwh": round(soc, 4),
-        "fleet_capacity_mwh": round(fleet.capacity_mwh, 4),
-        "fleet_power_mw": round(fleet.power_mw, 4),
+    for h in range(NUM_HOURS):
+        for s in range(NUM_SCENARIOS):
+            # Price coefficient: a_{s,h} = λ at chronological index
+            a_sh: float = prices[h * NUM_SCENARIOS + s]
+            d_sh: float = d[s][h]
+
+            # Constraint (1) — complementarity
+            if abs(d_sh) > 1e-9:
+                q_sh = 0.0
+            # Constraints (2) & (3) — optimise over box [q_min, q_max]
+            elif a_sh > 0:
+                q_sh = q_min   # minimise q  →  maximise −a·q  (a > 0)
+            elif a_sh < 0:
+                q_sh = q_max   # maximise q  →  adjustment earns revenue (a < 0)
+            else:
+                q_sh = q_mid   # indifferent
+
+            contribution = a_sh * (d_sh - q_sh)
+            total_objective += contribution
+            scenario_objectives[s] += contribution
+
+            schedule.append(
+                AdjustmentRow(
+                    scenario=s + 1,
+                    hour=h + 1,
+                    price_coefficient=round(a_sh, 4),
+                    reference_dispatch_mw=round(d_sh, 4),
+                    adjusted_quantity_mw=round(q_sh, 4),
+                    obj_contribution=round(contribution, 4),
+                )
+            )
+
+    kpis: dict[str, float] = {
+        "total_objective_eur": round(total_objective, 2),
+        "max_capacity_mw": round(max_capacity, 4),
+        "q_lower_bound_mw": round(q_min, 4),
+        "q_upper_bound_mw": round(q_max, 4),
+        "num_intervals": NUM_INTERVALS,
+        **{
+            f"scenario_{s + 1}_objective_eur": round(scenario_objectives[s], 2)
+            for s in range(NUM_SCENARIOS)
+        },
     }
-    return OptimizationResult(status="optimized", kpis=kpis, schedule=schedule)
 
-
-def _price_thresholds(prices: list[float], fleet: AggregatedFleet) -> tuple[float, float]:
-    ordered = sorted(prices)
-    low_index = max(0, int(len(ordered) * 0.3) - 1)
-    high_index = min(len(ordered) - 1, int(len(ordered) * 0.7))
-    low = ordered[low_index]
-    high = ordered[high_index]
-    if high - low < fleet.degradation_cost_eur_mwh / max(fleet.round_trip_efficiency, 1e-9):
-        avg = mean(prices)
-        return avg - 1e-6, avg + fleet.degradation_cost_eur_mwh + 1e-6
-    return low, high
-
-
-def _interval_hours(rows: list[MarketRow]) -> float:
-    deltas = [
-        (rows[index + 1].timestamp - rows[index].timestamp).total_seconds() / 3600
-        for index in range(len(rows) - 1)
-        if rows[index + 1].timestamp > rows[index].timestamp
-    ]
-    return min(deltas) if deltas else 1.0
-
-
-def _restore_final_soc(
-    schedule: list[ScheduleRow],
-    rows: list[MarketRow],
-    fleet: AggregatedFleet,
-    soc: float,
-    charge_eff: float,
-    charge_cost: float,
-    charged_mwh: float,
-    throughput_mwh: float,
-) -> tuple[list[ScheduleRow], float, float, float, float]:
-    needed_input = (fleet.initial_soc_mwh - soc) / charge_eff
-    if needed_input <= 0:
-        return schedule, charge_cost, charged_mwh, throughput_mwh, soc
-    cheapest_index = min(range(len(rows)), key=lambda index: rows[index].price_eur_mwh)
-    row = rows[cheapest_index]
-    charge_cost += needed_input * row.price_eur_mwh
-    charged_mwh += needed_input
-    throughput_mwh += needed_input
-    soc = fleet.initial_soc_mwh
-    original = schedule[cheapest_index]
-    schedule[cheapest_index] = ScheduleRow(
-        timestamp=original.timestamp,
-        price_eur_mwh=original.price_eur_mwh,
-        action="charge" if original.action == "idle" else original.action,
-        charge_mw=round(original.charge_mw + needed_input / original.interval_hours, 4),
-        discharge_mw=original.discharge_mw,
-        soc_mwh=original.soc_mwh,
-        interval_hours=original.interval_hours,
-        explanation="Charge: restores the required final state of charge.",
-    )
-    return schedule, charge_cost, charged_mwh, throughput_mwh, soc
+    return AdjustmentResult(status="optimized", kpis=kpis, schedule=schedule)
