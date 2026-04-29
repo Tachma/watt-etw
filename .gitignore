@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+watt_etw.egg-info/
+
+frontend/node_modules/
+frontend/dist/
+
+.DS_Store
