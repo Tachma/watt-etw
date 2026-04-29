@@ -37,12 +37,13 @@ from pathlib import Path
 import pandas as pd
 
 from watt_etw.data import (
+    admie_fetcher,
+    carbon_fetcher,
     henex_parser,
     rae_geoportal,
     ttf_fetcher,
     weather_fetcher,
 )
-from watt_etw.data import carbon_fetcher
 from watt_etw.features import feature_builder
 
 logger = logging.getLogger(__name__)
@@ -57,6 +58,7 @@ class PipelineConfig:
     baseline_lon: float = 23.73
     include_res_weather: bool = True
     include_carbon: bool = True
+    include_admie: bool = True
     res_layers: dict[str, str] | None = None
     res_assets_per_layer: int | None = 50
     eua_ticker: str | None = None
@@ -95,6 +97,7 @@ def build_feature_matrix(
     baseline_lon: float = 23.73,
     include_res_weather: bool = True,
     include_carbon: bool = True,
+    include_admie: bool = True,
     res_layers: dict[str, str] | None = None,
     res_assets_per_layer: int | None = 50,
     eua_ticker: str | None = None,
@@ -135,7 +138,18 @@ def build_feature_matrix(
                 logger.warning("RES weather fetch failed: %s", exc)
                 res_weather = None
 
-    ttf_df = ttf_fetcher.fetch(start_date=start, end_date=end)
+    ttf_df = ttf_fetcher.load(start, end)
+
+    admie_df: pd.DataFrame | None = None
+    if include_admie:
+        try:
+            admie_df = admie_fetcher.fetch(start_date=start, end_date=end)
+            if admie_df.empty:
+                logger.warning("ADMIE fetch returned empty; load/RES forecast features will be missing")
+                admie_df = None
+        except Exception as exc:
+            logger.warning("ADMIE fetch failed: %s", exc)
+            admie_df = None
 
     carbon_df: pd.DataFrame | None = None
     if include_carbon:
@@ -156,6 +170,7 @@ def build_feature_matrix(
         prices_df=prices_df,
         weather_df=baseline_weather,
         ttf_df=ttf_df,
+        admie_df=admie_df,
         res_weather_df=res_weather,
         carbon_df=carbon_df,
         cache_path=features_cache,
@@ -172,6 +187,7 @@ def run(config: PipelineConfig) -> pd.DataFrame:
         baseline_lon=config.baseline_lon,
         include_res_weather=config.include_res_weather,
         include_carbon=config.include_carbon,
+        include_admie=config.include_admie,
         res_layers=config.res_layers,
         res_assets_per_layer=config.res_assets_per_layer,
         eua_ticker=config.eua_ticker,

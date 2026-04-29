@@ -69,7 +69,7 @@ def build(
     Args:
         prices_df:  Output of henex_parser.parse_all / load_or_parse.
         weather_df: Output of weather_fetcher.fetch.
-        ttf_df:     Output of ttf_fetcher.fetch.
+        ttf_df:     Output of ttf_fetcher.load.
         admie_df:   Output of admie_fetcher.fetch (optional).
         cache_path: If given, write the result to parquet at this path.
     """
@@ -152,23 +152,6 @@ def build(
         admie["res_forecast_mw"] = pd.to_numeric(admie["res_forecast_mw"], errors="coerce")
         df = df.merge(admie[["date", "hour", "load_forecast_mw", "res_forecast_mw"]],
                       on=["date", "hour"], how="left")
-        # Derived: net load and penetration ratio
-        df["net_load_forecast_mw"] = df["load_forecast_mw"] - df["res_forecast_mw"]
-        df["load_res_ratio"] = (
-            df["res_forecast_mw"] / df["load_forecast_mw"].replace(0, float("nan"))
-        )
-
-    # ------------------------------------------------------------------ #
-    # 5b. ADMIE ISP1 forecasts (optional)                                  #
-    # ------------------------------------------------------------------ #
-    if admie_df is not None and not admie_df.empty:
-        admie = admie_df.copy()
-        admie["date"] = pd.to_datetime(admie["date"])
-        admie["load_forecast_mw"] = pd.to_numeric(admie["load_forecast_mw"], errors="coerce")
-        admie["res_forecast_mw"] = pd.to_numeric(admie["res_forecast_mw"], errors="coerce")
-        df = df.merge(admie[["date", "hour", "load_forecast_mw", "res_forecast_mw"]],
-                      on=["date", "hour"], how="left")
-        # Derived: net load and penetration ratio
         df["net_load_forecast_mw"] = df["load_forecast_mw"] - df["res_forecast_mw"]
         df["load_res_ratio"] = (
             df["res_forecast_mw"] / df["load_forecast_mw"].replace(0, float("nan"))
