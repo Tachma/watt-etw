@@ -89,13 +89,37 @@ function App() {
       const batteryPayload = batteries.map((battery, index) =>
         normalizeBatteryPayload({ ...defaultBattery(index + 1), ...battery })
       );
-      const response = await fetch("/api/optimize", {
+
+      // Extract prices from the uploaded market rows for the selected date
+      const sorted = [...selectedRows].sort((a, b) =>
+        a.timestamp < b.timestamp ? -1 : 1
+      );
+      const priceValues = sorted.map((r) => Number(r.price_eur_mwh));
+
+      // Determine resolution: 96 = 15-min, 24 = hourly, otherwise aggregate
+      let pricePayload;
+      if (priceValues.length === 96) {
+        pricePayload = { prices_15min: priceValues };
+      } else if (priceValues.length === 24) {
+        pricePayload = { prices_hourly: priceValues };
+      } else if (priceValues.length > 0) {
+        // Aggregate to 24 hourly by averaging groups
+        const perHour = Math.floor(priceValues.length / 24);
+        const hourly = Array.from({ length: 24 }, (_, h) => {
+          const chunk = priceValues.slice(h * perHour, (h + 1) * perHour);
+          return chunk.reduce((s, v) => s + v, 0) / chunk.length;
+        });
+        pricePayload = { prices_hourly: hourly };
+      } else {
+        throw new Error("No market data for the selected date.");
+      }
+
+      const response = await fetch("/api/optimize-arbitrage", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           batteries: batteryPayload,
-          market_rows: rows,
-          selected_date: selectedDate
+          ...pricePayload
         })
       });
       const data = await parseJsonResponse(response, "Optimization failed");
