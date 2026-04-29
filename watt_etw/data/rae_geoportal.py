@@ -77,13 +77,19 @@ def fetch_layer_geojson(
     limit: int | None = None,
     timeout: int = 60,
 ) -> dict[str, Any]:
-    """Fetch one RAE WFS layer as GeoJSON."""
+    """Fetch one RAE WFS layer as GeoJSON in WGS84.
+
+    The RAE GeoServer's native CRS is Greek Grid (EPSG:2100, projected metres).
+    We request `srsName=EPSG:4326` so coordinates come back as decimal degrees
+    suitable for Open-Meteo and other lat/lon APIs.
+    """
     params: dict[str, Any] = {
         "service": "WFS",
         "version": "2.0.0",
         "request": "GetFeature",
         "typeNames": layer,
         "outputFormat": "application/json",
+        "srsName": "EPSG:4326",
     }
     if limit is not None:
         params["count"] = limit
@@ -98,14 +104,23 @@ def parse_geojson_assets(
     technology: str,
     layer: str,
 ) -> list[RenewableAsset]:
-    """Convert GeoJSON features to assets with representative coordinates."""
+    """Convert GeoJSON features to assets with representative coordinates.
+
+    Coordinates are validated as plausible WGS84 (|lat| ≤ 90, |lon| ≤ 180).
+    If the WFS returned a projected CRS by mistake, those features are dropped
+    rather than emitting bogus lat/lon to downstream weather APIs.
+    """
     assets: list[RenewableAsset] = []
+    skipped = 0
     for feature in geojson.get("features", []):
         geometry = feature.get("geometry") or {}
         coordinate = representative_coordinate(geometry)
         if coordinate is None:
             continue
         longitude, latitude = coordinate
+        if not (-90 <= latitude <= 90 and -180 <= longitude <= 180):
+            skipped += 1
+            continue
         properties = dict(feature.get("properties") or {})
         assets.append(
             RenewableAsset(
@@ -116,6 +131,12 @@ def parse_geojson_assets(
                 capacity_mw=find_capacity_mw(properties),
                 properties=properties,
             )
+        )
+    if skipped:
+        # GeoServer's `srsName=EPSG:4326` should prevent this; warn loudly if not.
+        import logging
+        logging.getLogger(__name__).warning(
+            "Dropped %d %s features with non-WGS84 coordinates", skipped, layer,
         )
     return assets
 

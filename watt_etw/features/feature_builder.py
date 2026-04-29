@@ -1,32 +1,34 @@
-"""Build the feature matrix by joining HENEX prices, TTF gas, and weather.
+"""Build the feature matrix at 15-minute resolution.
 
-`weather_df` is the single-location baseline (e.g. weather_fetcher.fetch for Athens).
-`res_weather_df` is the optional technology-aggregated RES weather table from
-weather_fetcher.fetch_renewable_weather_features(); when provided, its per-tech
-columns (e.g. wind_wind_speed_120m, solar_global_tilted_irradiance) are merged
-on date/hour alongside the baseline weather.
+Joins HENEX prices, Athens-baseline weather, per-tech RES weather, ADMIE
+ISP1 demand & RES forecasts, TTF gas, and EUA carbon prices into one
+DataFrame keyed on (date, mtu) where mtu ∈ 0..95.
 
-`carbon_df` is the optional output of carbon_fetcher.fetch (daily eua_eur_t).
+Hourly inputs (Athens weather, RES per-tech weather, hourly ADMIE) are
+broadcast across the 4 MTUs of the corresponding hour. Daily inputs (TTF,
+EUA) are broadcast across all 96 MTUs of the day.
 
-Output schema (one row per date-hour):
-    date, hour
-    -- price history (lags & rolling stats on MCP) --
-    mcp_lag1h, mcp_lag2h, mcp_lag24h, mcp_lag48h, mcp_lag168h
-    mcp_rolling_mean_24h, mcp_rolling_std_24h
+15-min output schema (one row per date × mtu):
+    date, mtu, hour, quarter
+    -- price history (lags & rolling stats on MCP, in 15-min steps) --
+    mcp_lag1, mcp_lag4, mcp_lag96, mcp_lag192, mcp_lag672
+    mcp_rolling_mean_96, mcp_rolling_std_96
     -- supply mix (from HENEX) --
     sell_total_mwh, gas_mwh, hydro_mwh, res_mwh, lignite_mwh, imports_mwh
     -- calendar --
-    day_of_week, month, hour_of_day, is_weekend, is_holiday_gr
+    day_of_week, month, hour_of_day, quarter_of_hour, mtu_of_day,
+    is_weekend, is_holiday_gr
     -- weather (Athens baseline) --
     temperature_2m, shortwave_radiation, wind_speed_10m, cloud_cover,
-    relative_humidity_2m, precipitation
+    relative_humidity_2m, precipitation, ...
     -- per-tech RES weather (if res_weather_df given) --
-    wind_*, hydro_*, hybrid_*, ... (capacity-weighted by technology)
+    wind_*, solar_*, hydro_*, hybrid_*, ... (capacity-weighted by tech)
     -- gas --
     ttf_eur_mwh, ttf_lag1d, ttf_lag7d
+    -- carbon --
+    eua_eur_t, eua_lag1d, eua_lag7d
     -- ADMIE ISP1 day-ahead forecasts --
-    load_forecast_mw, res_forecast_mw,
-    load_res_ratio, net_load_forecast_mw
+    load_forecast_mw, res_forecast_mw, load_res_ratio, net_load_forecast_mw
     -- target --
     mcp_eur_mwh
 """
@@ -48,11 +50,64 @@ except ImportError:
     logger.warning("holidays package not installed — is_holiday_gr will be 0")
 
 
+# 15-min lag definitions (steps × 15 minutes)
+_LAG_STEPS = {
+    "mcp_lag1":   1,    # 15 minutes
+    "mcp_lag4":   4,    # 1 hour
+    "mcp_lag96":  96,   # 1 day
+    "mcp_lag192": 192,  # 2 days
+    "mcp_lag672": 672,  # 1 week
+}
+_ROLL_WINDOW = 96  # 24 hours of 15-min steps
+
+
 def _greek_holidays(years: list[int]) -> set[date]:
     if not _HAS_HOLIDAYS:
         return set()
     gr = _holidays_lib.country_holidays("GR", years=years)
     return set(gr.keys())
+
+
+def _ensure_mtu(prices: pd.DataFrame) -> pd.DataFrame:
+    """Make sure prices_df is keyed on (date, mtu) at 15-min resolution.
+
+    Accepts either:
+      - already-15-min: must contain `mtu` (and optional hour/quarter).
+      - hourly:         must contain `hour`, no mtu — gets broadcast 4×.
+    """
+    if "mtu" in prices.columns:
+        out = prices.copy()
+    elif "hour" in prices.columns:
+        # Broadcast hourly rows to 4 MTUs each.
+        rows: list[pd.DataFrame] = []
+        for q in range(4):
+            tmp = prices.copy()
+            tmp["mtu"] = tmp["hour"] * 4 + q
+            tmp["quarter"] = q
+            rows.append(tmp)
+        out = pd.concat(rows, ignore_index=True)
+    else:
+        raise ValueError("prices_df must contain either `mtu` or `hour`")
+
+    if "hour" not in out.columns:
+        out["hour"] = (out["mtu"] // 4).astype(int)
+    if "quarter" not in out.columns:
+        out["quarter"] = (out["mtu"] % 4).astype(int)
+    return out
+
+
+def _broadcast_hourly_to_mtu(df_h: pd.DataFrame) -> pd.DataFrame:
+    """Replicate hourly rows to (date, mtu) with 4 quarters per hour.
+
+    `df_h` must contain `date` and `hour`. All other columns are repeated
+    across the 4 MTUs of that hour.
+    """
+    rows: list[pd.DataFrame] = []
+    for q in range(4):
+        tmp = df_h.copy()
+        tmp["mtu"] = tmp["hour"] * 4 + q
+        rows.append(tmp.drop(columns=["hour"]))
+    return pd.concat(rows, ignore_index=True)
 
 
 def build(
@@ -64,47 +119,37 @@ def build(
     carbon_df: pd.DataFrame | None = None,
     cache_path: str | Path | None = "data/processed/features.parquet",
 ) -> pd.DataFrame:
-    """Join all sources and engineer features.  Returns the feature DataFrame.
+    """Join all sources at 15-min resolution and engineer features.
 
     Args:
-        prices_df:  Output of henex_parser.parse_all / load_or_parse.
-        weather_df: Output of weather_fetcher.fetch.
-        ttf_df:     Output of ttf_fetcher.load.
-        admie_df:   Output of admie_fetcher.fetch (optional).
-        cache_path: If given, write the result to parquet at this path.
+        prices_df:      henex_parser output. May be 15-min (date, mtu) or
+                        hourly (date, hour) — hourly is broadcast 4× per hour.
+        weather_df:     Hourly Open-Meteo baseline (date, hour, ...).
+        ttf_df:         Daily TTF (date, ttf_eur_mwh).
+        admie_df:       ADMIE ISP1 forecasts. May be 15-min or hourly.
+        res_weather_df: Per-tech RES weather, hourly (date, hour, wind_*, ...).
+        carbon_df:      Daily EUA (date, eua_eur_t).
+        cache_path:     If given, write the result to parquet at this path.
     """
-    # ------------------------------------------------------------------ #
-    # 1. Normalise date types to datetime for consistent merging           #
-    # ------------------------------------------------------------------ #
-    prices = prices_df.copy()
+    prices = _ensure_mtu(prices_df)
     prices["date"] = pd.to_datetime(prices["date"])
-
-    weather = weather_df.copy()
-    weather["date"] = pd.to_datetime(weather["date"])
-
-    ttf = ttf_df.copy()
-    ttf["date"] = pd.to_datetime(ttf["date"])
+    prices = prices.sort_values(["date", "mtu"]).reset_index(drop=True)
 
     # ------------------------------------------------------------------ #
-    # 2. Sort prices and build price-lag features                          #
+    # 1. Price-lag features (15-min steps)                                 #
     # ------------------------------------------------------------------ #
-    prices = prices.sort_values(["date", "hour"]).reset_index(drop=True)
+    for col, steps in _LAG_STEPS.items():
+        prices[col] = prices["mcp_eur_mwh"].shift(steps)
 
-    prices["mcp_lag1h"] = prices["mcp_eur_mwh"].shift(1)
-    prices["mcp_lag2h"] = prices["mcp_eur_mwh"].shift(2)
-    prices["mcp_lag24h"] = prices["mcp_eur_mwh"].shift(24)
-    prices["mcp_lag48h"] = prices["mcp_eur_mwh"].shift(48)
-    prices["mcp_lag168h"] = prices["mcp_eur_mwh"].shift(168)
-
-    prices["mcp_rolling_mean_24h"] = (
-        prices["mcp_eur_mwh"].shift(1).rolling(24, min_periods=12).mean()
+    prices["mcp_rolling_mean_96"] = (
+        prices["mcp_eur_mwh"].shift(1).rolling(_ROLL_WINDOW, min_periods=48).mean()
     )
-    prices["mcp_rolling_std_24h"] = (
-        prices["mcp_eur_mwh"].shift(1).rolling(24, min_periods=12).std()
+    prices["mcp_rolling_std_96"] = (
+        prices["mcp_eur_mwh"].shift(1).rolling(_ROLL_WINDOW, min_periods=48).std()
     )
 
     # ------------------------------------------------------------------ #
-    # 3. Calendar features                                                 #
+    # 2. Calendar features                                                 #
     # ------------------------------------------------------------------ #
     years = sorted(prices["date"].dt.year.unique().tolist())
     gr_holidays = _greek_holidays(years)
@@ -112,25 +157,23 @@ def build(
     prices["day_of_week"] = prices["date"].dt.dayofweek
     prices["month"] = prices["date"].dt.month
     prices["hour_of_day"] = prices["hour"]
+    prices["quarter_of_hour"] = prices["quarter"]
+    prices["mtu_of_day"] = prices["mtu"]
     prices["is_weekend"] = (prices["day_of_week"] >= 5).astype(int)
     prices["is_holiday_gr"] = prices["date"].dt.date.isin(gr_holidays).astype(int)
 
     # ------------------------------------------------------------------ #
-    # 4. TTF gas lags (daily → broadcast to all hours of that day)        #
+    # 3. Weather (hourly → broadcast to 4 MTUs per hour)                   #
     # ------------------------------------------------------------------ #
-    ttf = ttf.sort_values("date").reset_index(drop=True)
-    ttf["ttf_lag1d"] = ttf["ttf_eur_mwh"].shift(1)
-    ttf["ttf_lag7d"] = ttf["ttf_eur_mwh"].shift(7)
+    weather = weather_df.copy()
+    weather["date"] = pd.to_datetime(weather["date"])
+    weather_mtu = _broadcast_hourly_to_mtu(weather)
 
-    # ------------------------------------------------------------------ #
-    # 5. Merge prices with weather + TTF                                   #
-    # ------------------------------------------------------------------ #
-    df = prices.merge(weather, on=["date", "hour"], how="left")
+    df = prices.merge(weather_mtu, on=["date", "mtu"], how="left")
 
     if res_weather_df is not None and not res_weather_df.empty:
         res = res_weather_df.copy()
         res["date"] = pd.to_datetime(res["date"])
-        # Avoid clashing column names with the baseline weather merge.
         overlap = (set(res.columns) - {"date", "hour"}) & set(df.columns)
         if overlap:
             logger.warning(
@@ -138,27 +181,43 @@ def build(
                 len(overlap), sorted(overlap),
             )
             res = res.drop(columns=list(overlap))
-        df = df.merge(res, on=["date", "hour"], how="left")
+        res_mtu = _broadcast_hourly_to_mtu(res)
+        df = df.merge(res_mtu, on=["date", "mtu"], how="left")
 
+    # ------------------------------------------------------------------ #
+    # 4. TTF gas (daily → broadcast to all 96 MTUs of the day)             #
+    # ------------------------------------------------------------------ #
+    ttf = ttf_df.copy()
+    ttf["date"] = pd.to_datetime(ttf["date"])
+    ttf = ttf.sort_values("date").reset_index(drop=True)
+    ttf["ttf_lag1d"] = ttf["ttf_eur_mwh"].shift(1)
+    ttf["ttf_lag7d"] = ttf["ttf_eur_mwh"].shift(7)
     df = df.merge(ttf, on="date", how="left")
 
     # ------------------------------------------------------------------ #
-    # 5b. ADMIE ISP1 forecasts (optional)                                  #
+    # 5. ADMIE ISP1 forecasts                                              #
     # ------------------------------------------------------------------ #
     if admie_df is not None and not admie_df.empty:
         admie = admie_df.copy()
         admie["date"] = pd.to_datetime(admie["date"])
         admie["load_forecast_mw"] = pd.to_numeric(admie["load_forecast_mw"], errors="coerce")
         admie["res_forecast_mw"] = pd.to_numeric(admie["res_forecast_mw"], errors="coerce")
-        df = df.merge(admie[["date", "hour", "load_forecast_mw", "res_forecast_mw"]],
-                      on=["date", "hour"], how="left")
+
+        if "mtu" in admie.columns:
+            admie_mtu = admie[["date", "mtu", "load_forecast_mw", "res_forecast_mw"]]
+        else:
+            # Hourly ADMIE — broadcast to 4 MTUs.
+            tmp = admie[["date", "hour", "load_forecast_mw", "res_forecast_mw"]]
+            admie_mtu = _broadcast_hourly_to_mtu(tmp)
+
+        df = df.merge(admie_mtu, on=["date", "mtu"], how="left")
         df["net_load_forecast_mw"] = df["load_forecast_mw"] - df["res_forecast_mw"]
         df["load_res_ratio"] = (
             df["res_forecast_mw"] / df["load_forecast_mw"].replace(0, float("nan"))
         )
 
     # ------------------------------------------------------------------ #
-    # 6. Carbon lags + merge                                               #
+    # 6. Carbon (daily → broadcast)                                        #
     # ------------------------------------------------------------------ #
     if carbon_df is not None and not carbon_df.empty:
         carbon = carbon_df.copy()
@@ -172,22 +231,25 @@ def build(
     # 7. Reorder                                                           #
     # ------------------------------------------------------------------ #
     col_order = [
-        "date", "hour",
-        "mcp_lag1h", "mcp_lag2h", "mcp_lag24h", "mcp_lag48h", "mcp_lag168h",
-        "mcp_rolling_mean_24h", "mcp_rolling_std_24h",
+        "date", "mtu", "hour", "quarter",
+        *_LAG_STEPS.keys(),
+        "mcp_rolling_mean_96", "mcp_rolling_std_96",
         "sell_total_mwh", "gas_mwh", "hydro_mwh", "res_mwh", "lignite_mwh", "imports_mwh",
-        "day_of_week", "month", "hour_of_day", "is_weekend", "is_holiday_gr",
+        "day_of_week", "month", "hour_of_day", "quarter_of_hour", "mtu_of_day",
+        "is_weekend", "is_holiday_gr",
         "temperature_2m", "shortwave_radiation", "wind_speed_10m",
         "cloud_cover", "relative_humidity_2m", "precipitation",
         "ttf_eur_mwh", "ttf_lag1d", "ttf_lag7d",
-        # ADMIE ISP1 forecasts
-        "load_forecast_mw", "res_forecast_mw", "net_load_forecast_mw", "load_res_ratio",
         "eua_eur_t", "eua_lag1d", "eua_lag7d",
+        "load_forecast_mw", "res_forecast_mw",
+        "net_load_forecast_mw", "load_res_ratio",
         "mcp_eur_mwh",
     ]
     existing = [c for c in col_order if c in df.columns]
     extra = [c for c in df.columns if c not in col_order]
     df = df[existing + extra]
+
+    df = df.sort_values(["date", "mtu"]).reset_index(drop=True)
 
     logger.info(
         "Feature matrix: %d rows × %d cols, date range %s → %s",
@@ -223,7 +285,8 @@ def load_or_build(
         prices_df,
         weather_df,
         ttf_df,
+        admie_df=admie_df,
         res_weather_df=res_weather_df,
         carbon_df=carbon_df,
-        admie_df=admie_df, cache_path=cache_path,
+        cache_path=cache_path,
     )

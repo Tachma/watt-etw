@@ -106,8 +106,8 @@ def build_feature_matrix(
     """Run the full data → feature pipeline and return the feature matrix."""
     logger.info("Pipeline start: %s → %s, henex=%s", start, end, henex_dir)
 
-    prices_df = henex_parser.load_or_parse(henex_dir)
-    logger.info("HENEX prices: %d rows", len(prices_df))
+    prices_df = henex_parser.load_or_parse(henex_dir, resolution="15min")
+    logger.info("HENEX prices (15-min): %d rows", len(prices_df))
 
     baseline_weather = weather_fetcher.fetch(
         start_date=start,
@@ -143,7 +143,7 @@ def build_feature_matrix(
     admie_df: pd.DataFrame | None = None
     if include_admie:
         try:
-            admie_df = admie_fetcher.fetch(start_date=start, end_date=end)
+            admie_df = admie_fetcher.fetch(start_date=start, end_date=end, resolution="15min")
             if admie_df.empty:
                 logger.warning("ADMIE fetch returned empty; load/RES forecast features will be missing")
                 admie_df = None

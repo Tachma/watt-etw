@@ -1,15 +1,21 @@
-"""Parse HENEX DAM Results Summary XLSX files into a tidy hourly DataFrame.
+"""Parse HENEX DAM Results Summary XLSX files into a tidy DataFrame.
 
 Handles two file formats automatically:
   - Pre-Oct 2025: 24-column hourly (MTU 1-24), MCP row = "Greece Mainland"
   - Oct 2025+:    96-column 15-min (MTU 1-96), MCP from "Greece Mainland (60min Index)"
-                  Volumes are summed across 4 quarters per hour.
 
 When multiple revisions exist for a date (v01, v02…), the highest is used.
 
-Output columns per date-hour (hour 0-23):
-    date, hour, mcp_eur_mwh, sell_total_mwh,
-    gas_mwh, hydro_mwh, res_mwh, lignite_mwh, imports_mwh
+Two output resolutions are supported via `resolution`:
+    - "15min" (default): one row per (date, mtu) with mtu in 0..95.
+                          For pre-Oct hourly files, the hourly value is broadcast
+                          across the 4 MTUs of that hour.
+    - "hourly":           one row per (date, hour) with hour in 0..23. Post-Oct
+                          15-min values are averaged into hours.
+
+15-min output schema:
+    date, mtu, hour, quarter, mcp_eur_mwh,
+    sell_total_mwh, gas_mwh, hydro_mwh, res_mwh, lignite_mwh, imports_mwh
 """
 from __future__ import annotations
 
@@ -24,6 +30,14 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 _NS = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+_VOLUME_LABELS = ("gas", "hydro", "renewables", "lignite", "imports")
+_VOLUME_KEY = {
+    "gas": "gas_mwh",
+    "hydro": "hydro_mwh",
+    "renewables": "res_mwh",
+    "lignite": "lignite_mwh",
+    "imports": "imports_mwh",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -61,17 +75,21 @@ def _parse_cells(row: list[str], col_start: int, n_cols: int) -> list[float | No
             for i in range(col_start, col_start + n_cols)]
 
 
-def _agg_15min_to_hourly(vals: list[float | None]) -> list[float | None]:
-    """Collapse 96 quarterly MW values into 24 hourly MWh values.
-
-    Each 15-min column is average MW for that interval.
-    MWh per hour = average MW over the hour (4 quarters averaged).
-    """
+def _avg_per_hour(vals_96: list[float | None]) -> list[float | None]:
+    """Average 96 quarter values into 24 hourly values."""
     out: list[float | None] = []
     for h in range(24):
-        quarter = vals[h * 4: h * 4 + 4]
-        nums = [v for v in quarter if v is not None]
+        chunk = vals_96[h * 4: h * 4 + 4]
+        nums = [v for v in chunk if v is not None]
         out.append(sum(nums) / len(nums) if nums else None)
+    return out
+
+
+def _broadcast_to_96(vals_24: list[float | None]) -> list[float | None]:
+    """Replicate each of 24 hourly values 4× to fill 96 MTUs."""
+    out: list[float | None] = []
+    for v in vals_24:
+        out.extend([v] * 4)
     return out
 
 
@@ -79,8 +97,15 @@ def _agg_15min_to_hourly(vals: list[float | None]) -> list[float | None]:
 # Single-file parser
 # ---------------------------------------------------------------------------
 
-def _parse_xlsx_day(path: Path) -> list[dict] | None:
-    """Return 24 hourly dicts for one HENEX Results Summary file, or None on error."""
+def _parse_xlsx_day(path: Path) -> dict[str, list[float | None]] | None:
+    """Parse one HENEX file and return per-section MTU-96 series.
+
+    Always normalises to 96-MTU (15-min) internally; pre-Oct hourly files are
+    broadcast 4×. Returns None on parse error. Returned dict has at minimum:
+        {"trading_date": date, "mcp_eur_mwh": [96 floats],
+         "sell_total_mwh": [...], "gas_mwh": [...], ...}
+    Missing sections are simply absent.
+    """
     try:
         date_str = path.stem[:8]
         trading_date = date(int(date_str[:4]), int(date_str[4:6]), int(date_str[6:8]))
@@ -105,18 +130,17 @@ def _parse_xlsx_day(path: Path) -> list[dict] | None:
         for row_el in rows_el
     ]
 
-    # Detect format: find the maximum number of integer-valued cells in the
-    # first 5 rows. New 15-min format has a row with 96 MTU labels; old
-    # hourly format peaks at 24.
+    if not grid:
+        return None
+
     max_numerics = max(
-        sum(1 for v in row[1:] if v.strip().lstrip("-").isdigit())
-        for row in grid[:5]
-        if row
+        (sum(1 for v in row[1:] if v.strip().lstrip("-").isdigit())
+         for row in grid[:5] if row),
+        default=0,
     )
     n_mtu = 96 if max_numerics >= 90 else 24
-
     is_quarterly = (n_mtu == 96)
-    data_cols = n_mtu   # number of value columns starting at index 1
+    data_cols = n_mtu
 
     sections: dict[str, list[float | None]] = {}
     next_is_mainland = False
@@ -136,26 +160,22 @@ def _parse_xlsx_day(path: Path) -> list[dict] | None:
             continue
 
         if is_quarterly:
-            # New format: prefer "60min Index" row (already hourly averages)
             if "60min index" in label:
                 vals = _parse_cells(row, 1, data_cols)
-                # These repeat the same value 4× per hour; take every 4th
-                sections["mcp_eur_mwh"] = [vals[h * 4] for h in range(24)
-                                            if h * 4 < len(vals)]
+                # 60min index repeats hourly value across 4 MTUs — keep as-is for 96.
+                sections["mcp_eur_mwh"] = vals[:96]
                 found_60min_index = True
                 next_is_mainland = False
                 continue
-            # Fallback: average 15-min MCP if 60min index not found yet
             if "15min mcp" in label and not found_60min_index:
-                raw = _parse_cells(row, 1, data_cols)
-                sections["mcp_eur_mwh"] = _agg_15min_to_hourly(raw)
+                sections["mcp_eur_mwh"] = _parse_cells(row, 1, data_cols)
                 next_is_mainland = False
                 continue
         else:
-            # Old format: "Greece Mainland" row directly after the header
             if next_is_mainland and label == "greece mainland":
                 key = "mcp_eur_mwh" if mainland_ctx == "mcp" else "sell_total_mwh"
-                sections[key] = _parse_cells(row, 1, data_cols)
+                vals_24 = _parse_cells(row, 1, data_cols)
+                sections[key] = _broadcast_to_96(vals_24)
                 next_is_mainland = False
                 continue
 
@@ -165,42 +185,27 @@ def _parse_xlsx_day(path: Path) -> list[dict] | None:
             mainland_ctx = "sell"
             continue
 
-        # "Greece Mainland" sell row (both formats — comes right after the header)
         if next_is_mainland and label == "greece mainland":
             raw = _parse_cells(row, 1, data_cols)
-            sections["sell_total_mwh"] = _agg_15min_to_hourly(raw) if is_quarterly else raw
+            sections["sell_total_mwh"] = raw if is_quarterly else _broadcast_to_96(raw)
             next_is_mainland = False
             continue
 
-        # Volume rows (same logic for both formats)
+        # Volume rows
         next_is_mainland = False
 
-        if label == "gas":
+        if label in _VOLUME_LABELS:
+            if label == "imports" and "(implicit)" in raw_label.lower():
+                continue
             raw = _parse_cells(row, 1, data_cols)
-            sections["gas_mwh"] = _agg_15min_to_hourly(raw) if is_quarterly else raw
-        elif label == "hydro":
-            raw = _parse_cells(row, 1, data_cols)
-            sections["hydro_mwh"] = _agg_15min_to_hourly(raw) if is_quarterly else raw
-        elif label == "renewables":
-            raw = _parse_cells(row, 1, data_cols)
-            sections["res_mwh"] = _agg_15min_to_hourly(raw) if is_quarterly else raw
-        elif label == "lignite":
-            raw = _parse_cells(row, 1, data_cols)
-            sections["lignite_mwh"] = _agg_15min_to_hourly(raw) if is_quarterly else raw
-        elif label == "imports":
-            if "(implicit)" not in raw_label.lower():
-                raw = _parse_cells(row, 1, data_cols)
-                sections["imports_mwh"] = _agg_15min_to_hourly(raw) if is_quarterly else raw
+            sections[_VOLUME_KEY[label]] = raw if is_quarterly else _broadcast_to_96(raw)
 
     if "mcp_eur_mwh" not in sections:
         logger.warning("No MCP data in %s — skipping", path.name)
         return None
 
-    return [
-        {"date": trading_date, "hour": h,
-         **{k: (v[h] if v and h < len(v) else None) for k, v in sections.items()}}
-        for h in range(24)
-    ]
+    sections["trading_date"] = trading_date
+    return sections
 
 
 # ---------------------------------------------------------------------------
@@ -218,13 +223,54 @@ def _best_file_per_date(files: list[Path]) -> list[Path]:
     return sorted(by_date.values())
 
 
-def parse_dirs(*data_dirs: str | Path) -> pd.DataFrame:
-    """Parse all HENEX Results Summary XLSX files across one or more directories.
+def _records_15min(parsed: dict) -> list[dict]:
+    trading_date: date = parsed["trading_date"]
+    records: list[dict] = []
+    for mtu in range(96):
+        rec: dict = {
+            "date": trading_date,
+            "mtu": mtu,
+            "hour": mtu // 4,
+            "quarter": mtu % 4,
+        }
+        for key, vals in parsed.items():
+            if key == "trading_date":
+                continue
+            rec[key] = vals[mtu] if mtu < len(vals) else None
+        records.append(rec)
+    return records
 
-    Returns a DataFrame sorted by date and hour with columns:
-        date, hour, mcp_eur_mwh, sell_total_mwh,
-        gas_mwh, hydro_mwh, res_mwh, lignite_mwh, imports_mwh
+
+def _records_hourly(parsed: dict) -> list[dict]:
+    trading_date: date = parsed["trading_date"]
+    hourly_sections: dict[str, list[float | None]] = {}
+    for key, vals in parsed.items():
+        if key == "trading_date":
+            continue
+        hourly_sections[key] = _avg_per_hour(vals)
+
+    records: list[dict] = []
+    for h in range(24):
+        rec: dict = {"date": trading_date, "hour": h}
+        for key, vals in hourly_sections.items():
+            rec[key] = vals[h] if h < len(vals) else None
+        records.append(rec)
+    return records
+
+
+def parse_dirs(
+    *data_dirs: str | Path,
+    resolution: str = "15min",
+) -> pd.DataFrame:
+    """Parse all HENEX Results Summary XLSX files into a tidy DataFrame.
+
+    `resolution` must be either "15min" (default) or "hourly". Output sort key:
+        - 15min:   date, mtu
+        - hourly:  date, hour
     """
+    if resolution not in ("15min", "hourly"):
+        raise ValueError(f"resolution must be '15min' or 'hourly', got {resolution!r}")
+
     all_files: list[Path] = []
     for d in data_dirs:
         d = Path(d)
@@ -237,25 +283,32 @@ def parse_dirs(*data_dirs: str | Path) -> pd.DataFrame:
         raise FileNotFoundError(f"No XLSX files found in: {data_dirs}")
 
     files = _best_file_per_date(all_files)
-    logger.info("Parsing %d files from %d director(ies)", len(files), len(data_dirs))
+    logger.info(
+        "Parsing %d files (%s) from %d director(ies)",
+        len(files), resolution, len(data_dirs),
+    )
 
     all_records: list[dict] = []
     skipped = 0
     for path in files:
-        records = _parse_xlsx_day(path)
-        if records is None:
+        parsed = _parse_xlsx_day(path)
+        if parsed is None:
             skipped += 1
+            continue
+        if resolution == "15min":
+            all_records.extend(_records_15min(parsed))
         else:
-            all_records.extend(records)
+            all_records.extend(_records_hourly(parsed))
 
     if not all_records:
         raise ValueError("No valid records parsed.")
 
     df = pd.DataFrame(all_records)
     df["date"] = pd.to_datetime(df["date"])
-    numeric_cols = [c for c in df.columns if c not in ("date", "hour")]
+    sort_keys = ["date", "mtu"] if resolution == "15min" else ["date", "hour"]
+    numeric_cols = [c for c in df.columns if c not in ("date", *sort_keys, "hour", "quarter")]
     df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, errors="coerce")
-    df = df.sort_values(["date", "hour"]).reset_index(drop=True)
+    df = df.sort_values(sort_keys).reset_index(drop=True)
 
     logger.info(
         "Parsed %d trading days (%d rows), skipped %d files",
@@ -268,15 +321,22 @@ def load_or_parse(
     *data_dirs: str | Path,
     cache_path: str | Path = "data/processed/prices.parquet",
     force: bool = False,
+    resolution: str = "15min",
 ) -> pd.DataFrame:
-    """Return cached parquet if available, otherwise parse and cache."""
-    cache_path = Path(cache_path)
-    if cache_path.exists() and not force:
-        logger.info("Loading HENEX prices from cache: %s", cache_path)
-        return pd.read_parquet(cache_path)
+    """Return cached parquet if available, otherwise parse and cache.
 
-    df = parse_dirs(*data_dirs)
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
-    df.to_parquet(cache_path, index=False)
-    logger.info("Saved %d rows → %s", len(df), cache_path)
+    The cache file path is suffixed with the resolution so 15-min and hourly
+    caches do not clash.
+    """
+    cache_path = Path(cache_path)
+    suffixed = cache_path.with_name(f"{cache_path.stem}_{resolution}{cache_path.suffix}")
+
+    if suffixed.exists() and not force:
+        logger.info("Loading HENEX prices from cache: %s", suffixed)
+        return pd.read_parquet(suffixed)
+
+    df = parse_dirs(*data_dirs, resolution=resolution)
+    suffixed.parent.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(suffixed, index=False)
+    logger.info("Saved %d rows → %s", len(df), suffixed)
     return df

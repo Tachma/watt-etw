@@ -10,10 +10,13 @@ Two file formats exist:
   - Pre-Oct 2025:  48 MTUs (30-min intervals), values start at column 2
   - Oct 2025+:     96 MTUs (15-min intervals), values start at column 4
 
-Both are aggregated to hourly by averaging (values are in MW).
+Two output resolutions are supported:
+  - resolution="15min" (default): one row per (date, mtu) with mtu in 0..95.
+        Pre-Oct 30-min values are broadcast 2× to fill 96 MTUs.
+  - resolution="hourly":           one row per (date, hour) with hour in 0..23.
 
-Output: one row per date-hour with columns:
-    date, hour, load_forecast_mw, res_forecast_mw
+15-min schema:
+    date, mtu, hour, quarter, load_forecast_mw, res_forecast_mw
 """
 from __future__ import annotations
 
@@ -33,7 +36,6 @@ logger = logging.getLogger(__name__)
 
 _BASE_URL = "https://www.admie.gr"
 _CACHE_DIR = Path("data/external/admie")
-_15MIN_CUTOVER = date(2025, 10, 1)   # ADMIE switched to 96 intervals here
 
 # We take ISP1 (D-1 at 13:30) as the representative forecast
 _CATEGORIES = {
@@ -79,7 +81,7 @@ def _best_file_per_date(files: list[dict]) -> dict[date, str]:
 
 
 # ---------------------------------------------------------------------------
-# XLSX parser
+# XLSX parser → 96-MTU series
 # ---------------------------------------------------------------------------
 
 def _shared_strings(zf: zipfile.ZipFile) -> dict[int, str]:
@@ -103,11 +105,11 @@ def _cell_value(c: ET.Element, ss: dict[int, str]) -> str:
     return ss.get(int(raw), raw) if t == "s" else raw
 
 
-def _parse_forecast_xlsx(content: bytes, trading_date: date) -> list[float | None]:
-    """Parse one ISP forecast file and return 24 hourly MW values.
+def _parse_forecast_xlsx(content: bytes) -> list[float | None]:
+    """Parse one ISP forecast file and return 96 quarter-hour MW values.
 
-    Handles both 48-interval (30-min, pre-Oct 2025) and
-    96-interval (15-min, Oct 2025+) formats automatically.
+    Pre-Oct 2025 (48 intervals, 30-min) values are duplicated 2× to fill 96.
+    Returns 96 values, possibly with Nones for missing data.
     """
     NS = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
     with zipfile.ZipFile(io.BytesIO(content)) as zf:
@@ -121,9 +123,8 @@ def _parse_forecast_xlsx(content: bytes, trading_date: date) -> list[float | Non
         for row_el in rows_el
     ]
 
-    # Find the row that starts with "Load Forecast" or "RES forecast"
     data_row: list[str] | None = None
-    n_mtu = 48    # default (pre-Oct 2025)
+    n_mtu = 48
 
     for row in grid:
         if not row:
@@ -134,9 +135,8 @@ def _parse_forecast_xlsx(content: bytes, trading_date: date) -> list[float | Non
             break
 
     if data_row is None:
-        return [None] * 24
+        return [None] * 96
 
-    # Detect number of MTU intervals from the header row
     for row in grid[:6]:
         nums = [v for v in row[1:] if v.strip().lstrip("-").isdigit()]
         if len(nums) >= 90:
@@ -146,50 +146,76 @@ def _parse_forecast_xlsx(content: bytes, trading_date: date) -> list[float | Non
             n_mtu = 48
             break
 
-    # Determine the data column offset
-    # Pre-Oct 2025: col 0=label, col 1=source, col 2..2+48 = values
-    # Oct 2025+:    col 0=label, col 1=label, col 2=NA, col 3=date, col 4..4+96 = values
     col_offset = 4 if n_mtu == 96 else 2
 
-    # Extract the MTU values
-    mtu_vals: list[float | None] = []
+    raw_vals: list[float | None] = []
     for i in range(n_mtu):
         idx = col_offset + i
         try:
-            mtu_vals.append(float(data_row[idx]))
+            raw_vals.append(float(data_row[idx]))
         except (IndexError, ValueError, TypeError):
-            mtu_vals.append(None)
+            raw_vals.append(None)
 
-    # Aggregate to 24 hourly values (average MW across intervals per hour)
-    intervals_per_hour = n_mtu // 24   # 2 for 30-min, 4 for 15-min
-    hourly: list[float | None] = []
+    if n_mtu == 96:
+        return raw_vals
+    # 30-min → 15-min: each 30-min value covers 2 quarters
+    out: list[float | None] = []
+    for v in raw_vals:
+        out.extend([v, v])
+    # Pad to 96 if short
+    while len(out) < 96:
+        out.append(None)
+    return out[:96]
+
+
+def _to_hourly(vals_96: list[float | None]) -> list[float | None]:
+    """Average 96 quarter-hour MW values into 24 hourly MW values."""
+    out: list[float | None] = []
     for h in range(24):
-        chunk = mtu_vals[h * intervals_per_hour: (h + 1) * intervals_per_hour]
+        chunk = vals_96[h * 4: h * 4 + 4]
         nums = [v for v in chunk if v is not None]
-        hourly.append(round(sum(nums) / len(nums), 3) if nums else None)
-
-    return hourly
+        out.append(round(sum(nums) / len(nums), 3) if nums else None)
+    return out
 
 
 # ---------------------------------------------------------------------------
-# Cache helpers
+# Cache helpers (all caches store 96-MTU series; hourly is derived on read)
 # ---------------------------------------------------------------------------
 
 def _cache_path(d: date, kind: str) -> Path:
+    """15-min cache. Stores a JSON list of 96 floats/Nones."""
+    return _CACHE_DIR / str(d.year) / kind / f"{d.isoformat()}_15min.json"
+
+
+def _legacy_hourly_cache_path(d: date, kind: str) -> Path:
+    """Older cache layout from the hourly-only era."""
     return _CACHE_DIR / str(d.year) / kind / f"{d.isoformat()}.json"
 
 
-def _save_cache(d: date, kind: str, hourly: list[float | None]) -> None:
+def _save_cache(d: date, kind: str, vals_96: list[float | None]) -> None:
     p = _cache_path(d, kind)
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(hourly))
+    p.write_text(json.dumps(vals_96))
 
 
 def _load_cache(d: date, kind: str) -> list[float | None] | None:
     p = _cache_path(d, kind)
-    if not p.exists():
-        return None
-    return json.loads(p.read_text())
+    if p.exists():
+        return json.loads(p.read_text())
+    # Legacy hourly cache fallback: broadcast 24 values × 4 to fill 96 MTUs.
+    legacy = _legacy_hourly_cache_path(d, kind)
+    if legacy.exists():
+        try:
+            hourly = json.loads(legacy.read_text())
+        except Exception:
+            return None
+        if isinstance(hourly, list) and len(hourly) >= 24:
+            vals_96: list[float | None] = []
+            for h in range(24):
+                v = hourly[h]
+                vals_96.extend([v, v, v, v])
+            return vals_96
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -216,13 +242,19 @@ def fetch(
     cache_dir: str | Path = _CACHE_DIR,
     force: bool = False,
     batch_days: int = 30,
+    resolution: str = "15min",
 ) -> pd.DataFrame:
     """Download ISP1 day-ahead load and RES forecasts for [start_date, end_date].
 
-    Results are cached per day under data/external/admie/.
+    Cached per day at 15-min resolution under data/external/admie/.
 
-    Returns DataFrame: date, hour, load_forecast_mw, res_forecast_mw
+    Returns DataFrame:
+        - resolution="15min":   date, mtu, hour, quarter, load_forecast_mw, res_forecast_mw
+        - resolution="hourly":  date, hour, load_forecast_mw, res_forecast_mw
     """
+    if resolution not in ("15min", "hourly"):
+        raise ValueError(f"resolution must be '15min' or 'hourly', got {resolution!r}")
+
     global _CACHE_DIR
     _CACHE_DIR = Path(cache_dir)
 
@@ -238,7 +270,7 @@ def fetch(
             if force or _load_cache(d, kind) is None:
                 missing[kind].append(d)
 
-    # Download in batches to avoid hammering the API
+    # Download in monthly batches to avoid hammering the API
     for kind, category in _CATEGORIES.items():
         days_needed = missing[kind]
         if not days_needed:
@@ -249,7 +281,6 @@ def fetch(
             kind, len(days_needed), days_needed[0], days_needed[-1],
         )
 
-        # Break into monthly batches
         i = 0
         while i < len(days_needed):
             batch = days_needed[i: i + batch_days]
@@ -270,31 +301,45 @@ def fetch(
                 url = url_by_date.get(d)
                 if url is None:
                     logger.warning("No %s file for %s", kind, d)
-                    _save_cache(d, kind, [None] * 24)
+                    _save_cache(d, kind, [None] * 96)
                     continue
 
                 try:
                     content = _download_with_retry(url)
-                    hourly = _parse_forecast_xlsx(content, d)
-                    _save_cache(d, kind, hourly)
+                    vals_96 = _parse_forecast_xlsx(content)
+                    _save_cache(d, kind, vals_96)
                 except Exception as exc:
                     logger.error("Failed to parse %s for %s: %s", kind, d, exc)
-                    _save_cache(d, kind, [None] * 24)
+                    _save_cache(d, kind, [None] * 96)
 
             i += batch_days
 
     # Assemble DataFrame from cache
     records: list[dict] = []
     for d in all_days:
-        load_vals = _load_cache(d, "load") or [None] * 24
-        res_vals  = _load_cache(d, "res")  or [None] * 24
-        for h in range(24):
-            records.append({
-                "date": d,
-                "hour": h,
-                "load_forecast_mw": load_vals[h] if h < len(load_vals) else None,
-                "res_forecast_mw":  res_vals[h]  if h < len(res_vals)  else None,
-            })
+        load_vals = _load_cache(d, "load") or [None] * 96
+        res_vals  = _load_cache(d, "res")  or [None] * 96
+
+        if resolution == "15min":
+            for mtu in range(96):
+                records.append({
+                    "date": d,
+                    "mtu": mtu,
+                    "hour": mtu // 4,
+                    "quarter": mtu % 4,
+                    "load_forecast_mw": load_vals[mtu] if mtu < len(load_vals) else None,
+                    "res_forecast_mw":  res_vals[mtu]  if mtu < len(res_vals)  else None,
+                })
+        else:
+            load_h = _to_hourly(load_vals)
+            res_h = _to_hourly(res_vals)
+            for h in range(24):
+                records.append({
+                    "date": d,
+                    "hour": h,
+                    "load_forecast_mw": load_h[h],
+                    "res_forecast_mw":  res_h[h],
+                })
 
     df = pd.DataFrame(records)
     df["date"] = pd.to_datetime(df["date"])
@@ -302,8 +347,8 @@ def fetch(
     df["res_forecast_mw"]  = pd.to_numeric(df["res_forecast_mw"],  errors="coerce")
 
     logger.info(
-        "ADMIE: %d rows, load NaN=%d, res NaN=%d",
-        len(df),
+        "ADMIE: %d rows (%s), load NaN=%d, res NaN=%d",
+        len(df), resolution,
         df["load_forecast_mw"].isna().sum(),
         df["res_forecast_mw"].isna().sum(),
     )
