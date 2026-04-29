@@ -171,8 +171,12 @@ class PriceForecaster:
                 preds = model.predict(X_te)
                 mae = float(np.mean(np.abs(preds - y_te)))
                 rmse = float(np.sqrt(np.mean((preds - y_te) ** 2)))
-                nonzero = y_te != 0
-                mape = float(np.mean(np.abs((preds[nonzero] - y_te[nonzero]) / y_te[nonzero])) * 100)
+                # MAPE: exclude prices < 5 EUR/MWh to avoid near-zero division
+                meaningful = np.abs(y_te) >= 5
+                if meaningful.any():
+                    mape = float(np.mean(np.abs((preds[meaningful] - y_te[meaningful]) / y_te[meaningful])) * 100)
+                else:
+                    mape = float("nan")
                 metrics[hour] = EvalMetrics(mae=mae, rmse=rmse, mape=mape, n_samples=len(y_te))
                 logger.info("Hour %02d → MAE=%.2f  RMSE=%.2f  MAPE=%.1f%%", hour, mae, rmse, mape)
             else:

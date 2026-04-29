@@ -1,17 +1,21 @@
 """Parse HENEX DAM Results Summary XLSX files into a tidy hourly DataFrame.
 
-Each file covers one trading day and contains per-MTU (hour 1-24) values for:
-  - Market Clearing Price (€/MWh)
-  - Total cleared sell volume (MWh)
-  - Supply by technology: Gas, Hydro, Renewables, Lignite
-  - Total imports
+Handles two file formats automatically:
+  - Pre-Oct 2025: 24-column hourly (MTU 1-24), MCP row = "Greece Mainland"
+  - Oct 2025+:    96-column 15-min (MTU 1-96), MCP from "Greece Mainland (60min Index)"
+                  Volumes are summed across 4 quarters per hour.
+
+When multiple revisions exist for a date (v01, v02…), the highest is used.
+
+Output columns per date-hour (hour 0-23):
+    date, hour, mcp_eur_mwh, sell_total_mwh,
+    gas_mwh, hydro_mwh, res_mwh, lignite_mwh, imports_mwh
 """
 from __future__ import annotations
 
 import logging
-import re
 import zipfile
-from datetime import date, datetime
+from datetime import date
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
@@ -21,6 +25,10 @@ logger = logging.getLogger(__name__)
 
 _NS = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
 
+
+# ---------------------------------------------------------------------------
+# Low-level XLSX helpers
+# ---------------------------------------------------------------------------
 
 def _shared_strings(zf: zipfile.ZipFile) -> dict[int, str]:
     with zf.open("xl/sharedStrings.xml") as fh:
@@ -41,21 +49,40 @@ def _cell_value(c: ET.Element, ss: dict[int, str]) -> str:
     return ss.get(int(raw), raw) if t == "s" else raw
 
 
-def _parse_floats(cells: list[str], cols: range) -> list[float | None]:
-    """Return float values for column indices in `cols`."""
+def _to_float(s: str) -> float | None:
+    try:
+        return float(s)
+    except (ValueError, TypeError):
+        return None
+
+
+def _parse_cells(row: list[str], col_start: int, n_cols: int) -> list[float | None]:
+    return [_to_float(row[i]) if i < len(row) else None
+            for i in range(col_start, col_start + n_cols)]
+
+
+def _agg_15min_to_hourly(vals: list[float | None]) -> list[float | None]:
+    """Collapse 96 quarterly MW values into 24 hourly MWh values.
+
+    Each 15-min column is average MW for that interval.
+    MWh per hour = average MW over the hour (4 quarters averaged).
+    """
     out: list[float | None] = []
-    for i in cols:
-        try:
-            out.append(float(cells[i]))
-        except (IndexError, ValueError):
-            out.append(None)
+    for h in range(24):
+        quarter = vals[h * 4: h * 4 + 4]
+        nums = [v for v in quarter if v is not None]
+        out.append(sum(nums) / len(nums) if nums else None)
     return out
 
 
+# ---------------------------------------------------------------------------
+# Single-file parser
+# ---------------------------------------------------------------------------
+
 def _parse_xlsx_day(path: Path) -> list[dict] | None:
-    """Return list of 24 dicts (one per hour) for a single trading day file."""
+    """Return 24 hourly dicts for one HENEX Results Summary file, or None on error."""
     try:
-        date_str = path.stem[:8]  # YYYYMMDD
+        date_str = path.stem[:8]
         trading_date = date(int(date_str[:4]), int(date_str[4:6]), int(date_str[6:8]))
     except Exception:
         logger.warning("Cannot parse date from filename: %s", path.name)
@@ -69,86 +96,148 @@ def _parse_xlsx_day(path: Path) -> list[dict] | None:
 
     with zf:
         ss = _shared_strings(zf)
-        # sheet1.xml is the Results Summary sheet
         with zf.open("xl/worksheets/sheet1.xml") as fh:
             tree = ET.parse(fh)
 
-        rows_el = tree.findall(f"{_NS}sheetData/{_NS}row")
-        # Convert to list of cell-value lists
-        grid: list[list[str]] = []
-        for row_el in rows_el:
-            cells = [_cell_value(c, ss) for c in row_el.findall(f"{_NS}c")]
-            grid.append(cells)
+    rows_el = tree.findall(f"{_NS}sheetData/{_NS}row")
+    grid: list[list[str]] = [
+        [_cell_value(c, ss) for c in row_el.findall(f"{_NS}c")]
+        for row_el in rows_el
+    ]
 
-    # The MTU columns 1-24 sit in columns B-Y (index 1-24) of row 2 (index 1).
-    # We identify sections by scanning col A (index 0) for known labels.
-    hour_cols = range(1, 25)  # 24 columns
+    # Detect format: find the maximum number of integer-valued cells in the
+    # first 5 rows. New 15-min format has a row with 96 MTU labels; old
+    # hourly format peaks at 24.
+    max_numerics = max(
+        sum(1 for v in row[1:] if v.strip().lstrip("-").isdigit())
+        for row in grid[:5]
+        if row
+    )
+    n_mtu = 96 if max_numerics >= 90 else 24
+
+    is_quarterly = (n_mtu == 96)
+    data_cols = n_mtu   # number of value columns starting at index 1
 
     sections: dict[str, list[float | None]] = {}
-    next_row_is_mainland = False
-    mainland_context = ""
+    next_is_mainland = False
+    mainland_ctx = ""
+    found_60min_index = False
 
     for row in grid:
         if not row:
             continue
-        label = (row[0] if row else "").strip().lower()
+        raw_label = row[0]
+        label = raw_label.strip().lower()
 
+        # ---- MCP section ------------------------------------------------
         if label == "market clearing price":
-            next_row_is_mainland = True
-            mainland_context = "mcp"
-            continue
-        if label == "total sell trades":
-            next_row_is_mainland = True
-            mainland_context = "sell"
-            continue
-        if next_row_is_mainland and label == "greece mainland":
-            key = "mcp_eur_mwh" if mainland_context == "mcp" else "sell_total_mwh"
-            sections[key] = _parse_floats(row, hour_cols)
-            next_row_is_mainland = False
+            next_is_mainland = True
+            mainland_ctx = "mcp"
             continue
 
-        next_row_is_mainland = False
+        if is_quarterly:
+            # New format: prefer "60min Index" row (already hourly averages)
+            if "60min index" in label:
+                vals = _parse_cells(row, 1, data_cols)
+                # These repeat the same value 4× per hour; take every 4th
+                sections["mcp_eur_mwh"] = [vals[h * 4] for h in range(24)
+                                            if h * 4 < len(vals)]
+                found_60min_index = True
+                next_is_mainland = False
+                continue
+            # Fallback: average 15-min MCP if 60min index not found yet
+            if "15min mcp" in label and not found_60min_index:
+                raw = _parse_cells(row, 1, data_cols)
+                sections["mcp_eur_mwh"] = _agg_15min_to_hourly(raw)
+                next_is_mainland = False
+                continue
+        else:
+            # Old format: "Greece Mainland" row directly after the header
+            if next_is_mainland and label == "greece mainland":
+                key = "mcp_eur_mwh" if mainland_ctx == "mcp" else "sell_total_mwh"
+                sections[key] = _parse_cells(row, 1, data_cols)
+                next_is_mainland = False
+                continue
+
+        # ---- Sell trades section ----------------------------------------
+        if label == "total sell trades":
+            next_is_mainland = True
+            mainland_ctx = "sell"
+            continue
+
+        # "Greece Mainland" sell row (both formats — comes right after the header)
+        if next_is_mainland and label == "greece mainland":
+            raw = _parse_cells(row, 1, data_cols)
+            sections["sell_total_mwh"] = _agg_15min_to_hourly(raw) if is_quarterly else raw
+            next_is_mainland = False
+            continue
+
+        # Volume rows (same logic for both formats)
+        next_is_mainland = False
 
         if label == "gas":
-            sections["gas_mwh"] = _parse_floats(row, hour_cols)
+            raw = _parse_cells(row, 1, data_cols)
+            sections["gas_mwh"] = _agg_15min_to_hourly(raw) if is_quarterly else raw
         elif label == "hydro":
-            sections["hydro_mwh"] = _parse_floats(row, hour_cols)
+            raw = _parse_cells(row, 1, data_cols)
+            sections["hydro_mwh"] = _agg_15min_to_hourly(raw) if is_quarterly else raw
         elif label == "renewables":
-            sections["res_mwh"] = _parse_floats(row, hour_cols)
+            raw = _parse_cells(row, 1, data_cols)
+            sections["res_mwh"] = _agg_15min_to_hourly(raw) if is_quarterly else raw
         elif label == "lignite":
-            sections["lignite_mwh"] = _parse_floats(row, hour_cols)
-        elif label == "imports":  # " IMPORTS" in file, stripped to "imports"
-            # skip "imports (implicit)" — we want the explicit total only
-            raw_label = (row[0] if row else "")
+            raw = _parse_cells(row, 1, data_cols)
+            sections["lignite_mwh"] = _agg_15min_to_hourly(raw) if is_quarterly else raw
+        elif label == "imports":
             if "(implicit)" not in raw_label.lower():
-                sections["imports_mwh"] = _parse_floats(row, hour_cols)
+                raw = _parse_cells(row, 1, data_cols)
+                sections["imports_mwh"] = _agg_15min_to_hourly(raw) if is_quarterly else raw
 
     if "mcp_eur_mwh" not in sections:
-        logger.warning("No MCP found in %s", path.name)
+        logger.warning("No MCP data in %s — skipping", path.name)
         return None
 
-    records = []
-    for h in range(24):
-        rec: dict = {"date": trading_date, "hour": h}
-        for key, vals in sections.items():
-            rec[key] = vals[h] if h < len(vals) else None
-        records.append(rec)
-
-    return records
+    return [
+        {"date": trading_date, "hour": h,
+         **{k: (v[h] if v and h < len(v) else None) for k, v in sections.items()}}
+        for h in range(24)
+    ]
 
 
-def parse_all(data_dir: str | Path, glob: str = "*.xlsx") -> pd.DataFrame:
-    """Parse every HENEX DAM Results Summary file in `data_dir`.
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
 
-    Returns a DataFrame with columns:
+def _best_file_per_date(files: list[Path]) -> list[Path]:
+    """Keep only the highest revision (v02 > v01) per date."""
+    by_date: dict[str, Path] = {}
+    for p in files:
+        key = p.stem[:8]
+        prev = by_date.get(key)
+        if prev is None or p.stem > prev.stem:
+            by_date[key] = p
+    return sorted(by_date.values())
+
+
+def parse_dirs(*data_dirs: str | Path) -> pd.DataFrame:
+    """Parse all HENEX Results Summary XLSX files across one or more directories.
+
+    Returns a DataFrame sorted by date and hour with columns:
         date, hour, mcp_eur_mwh, sell_total_mwh,
         gas_mwh, hydro_mwh, res_mwh, lignite_mwh, imports_mwh
-    sorted by date and hour.
     """
-    data_dir = Path(data_dir)
-    files = sorted(data_dir.glob(glob))
-    if not files:
-        raise FileNotFoundError(f"No XLSX files found in {data_dir}")
+    all_files: list[Path] = []
+    for d in data_dirs:
+        d = Path(d)
+        found = list(d.glob("*.xlsx"))
+        if not found:
+            logger.warning("No XLSX files in %s", d)
+        all_files.extend(found)
+
+    if not all_files:
+        raise FileNotFoundError(f"No XLSX files found in: {data_dirs}")
+
+    files = _best_file_per_date(all_files)
+    logger.info("Parsing %d files from %d director(ies)", len(files), len(data_dirs))
 
     all_records: list[dict] = []
     skipped = 0
@@ -160,35 +249,34 @@ def parse_all(data_dir: str | Path, glob: str = "*.xlsx") -> pd.DataFrame:
             all_records.extend(records)
 
     if not all_records:
-        raise ValueError("No valid records parsed from any file.")
+        raise ValueError("No valid records parsed.")
 
     df = pd.DataFrame(all_records)
     df["date"] = pd.to_datetime(df["date"])
-    df = df.sort_values(["date", "hour"]).reset_index(drop=True)
-
     numeric_cols = [c for c in df.columns if c not in ("date", "hour")]
     df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, errors="coerce")
+    df = df.sort_values(["date", "hour"]).reset_index(drop=True)
 
     logger.info(
-        "Parsed %d days (%d records), skipped %d files",
+        "Parsed %d trading days (%d rows), skipped %d files",
         df["date"].nunique(), len(df), skipped,
     )
     return df
 
 
 def load_or_parse(
-    data_dir: str | Path,
+    *data_dirs: str | Path,
     cache_path: str | Path = "data/processed/prices.parquet",
     force: bool = False,
 ) -> pd.DataFrame:
-    """Return cached parquet if it exists, otherwise parse and cache."""
+    """Return cached parquet if available, otherwise parse and cache."""
     cache_path = Path(cache_path)
     if cache_path.exists() and not force:
-        logger.info("Loading prices from cache: %s", cache_path)
+        logger.info("Loading HENEX prices from cache: %s", cache_path)
         return pd.read_parquet(cache_path)
 
-    df = parse_all(data_dir)
+    df = parse_dirs(*data_dirs)
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     df.to_parquet(cache_path, index=False)
-    logger.info("Saved %d rows to %s", len(df), cache_path)
+    logger.info("Saved %d rows → %s", len(df), cache_path)
     return df
