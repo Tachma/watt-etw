@@ -5,14 +5,11 @@ import "./styles.css";
 
 const defaultBattery = (index = 1) => ({
   name: `Battery ${index}`,
-  capacity_mwh: 50,
-  power_mw: 25,
-  round_trip_efficiency: 0.9,
-  initial_soc_pct: 50,
-  min_soc_pct: 10,
-  max_soc_pct: 95,
-  degradation_cost_eur_mwh: 5,
-  max_cycles_per_day: ""
+  capacity: 50,
+  min_capacity: 5,
+  efficiency: 0.9,
+  availability: 100,
+  ramp: 25
 });
 
 function App() {
@@ -57,11 +54,14 @@ function App() {
     setBusy(true);
     setError("");
     try {
+      const batteryPayload = batteries.map((battery, index) =>
+        normalizeBatteryPayload({ ...defaultBattery(index + 1), ...battery })
+      );
       const response = await fetch("/api/optimize", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          batteries,
+          batteries: batteryPayload,
           market_rows: rows,
           selected_date: selectedDate
         })
@@ -188,16 +188,33 @@ function App() {
   );
 }
 
+function normalizeBatteryPayload(battery) {
+  return {
+    name: battery.name || "Battery",
+    capacity: numericValue(battery.capacity, battery.capacity_mwh, battery.max_capacity, battery.max_capacity_mwh),
+    min_capacity: numericValue(battery.min_capacity, battery.min_capacity_mwh),
+    efficiency: numericValue(battery.efficiency, battery.effieciency, battery.round_trip_efficiency),
+    availability: numericValue(battery.availability, battery.availability_pct),
+    ramp: numericValue(battery.ramp, battery.ramp_mw, battery.power_mw)
+  };
+}
+
+function numericValue(...values) {
+  for (const value of values) {
+    if (value !== undefined && value !== null && value !== "") {
+      return Number(value);
+    }
+  }
+  return undefined;
+}
+
 function BatteryForm({ battery, onChange, onRemove, canRemove }) {
   const fields = [
-    ["capacity_mwh", "Capacity MWh"],
-    ["power_mw", "Power MW"],
-    ["round_trip_efficiency", "Efficiency"],
-    ["initial_soc_pct", "Initial SOC %"],
-    ["min_soc_pct", "Min SOC %"],
-    ["max_soc_pct", "Max SOC %"],
-    ["degradation_cost_eur_mwh", "Degradation EUR/MWh"],
-    ["max_cycles_per_day", "Max Cycles"]
+    ["capacity", "Capacity MWh"],
+    ["min_capacity", "Min Capacity MWh"],
+    ["efficiency", "Efficiency"],
+    ["availability", "Availability %"],
+    ["ramp", "Ramp MW"]
   ];
   return (
     <article className="panel">

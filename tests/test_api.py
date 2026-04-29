@@ -18,9 +18,18 @@ def test_validate_endpoint():
 
 def test_optimize_endpoint():
     payload = {
-        "batteries": [{"name": "A", "capacity_mwh": 20, "power_mw": 10}],
+        "batteries": [
+            {
+                "name": "A",
+                "capacity": 20,
+                "min_capacity": 2,
+                "efficiency": 0.9,
+                "availability": 100,
+                "ramp": 10,
+            }
+        ],
         "market_rows": [
-            {"timestamp": "2026-04-01T00:00:00", "price_eur_mwh": 10, "extra": {}},
+            {"timestamp": "2026-04-01T00:00:00", "price_eur_mwh": -0.01, "extra": {}},
             {"timestamp": "2026-04-01T01:00:00", "price_eur_mwh": 100, "extra": {}},
         ],
     }
