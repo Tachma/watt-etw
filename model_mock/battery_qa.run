@@ -1,0 +1,83 @@
+# =============================================================================
+# Battery Quantity Adjustment - AMPL Run Script
+# =============================================================================
+# Usage:
+#   ampl battery_qa.run
+#
+# Or interactively in the AMPL IDE:
+#   ampl: include battery_qa.run;
+# =============================================================================
+
+reset;
+
+# ----- Load model and data -----
+model battery_qa.mod;
+data  battery_qa.dat; 
+
+# ----- Solver selection -----
+# Use Gurobi if available; otherwise fall back to cbc (free, ships with AMPL CE)
+option solver gurobi;
+option gurobi_options 'outlev=1 mipgap=1e-6';
+
+# If you don't have Gurobi, comment the two lines above and uncomment:
+# option solver cbc;
+# option cbc_options 'ratio=1e-6';
+
+# Or use HiGHS (free, fast for MILP):
+# option solver highs;
+
+# ----- Solve -----
+solve;
+
+# ============================================================================
+# RESULTS
+# ============================================================================
+
+printf "\n";
+printf "================================================================\n";
+printf "  RESULT SUMMARY\n";
+printf "================================================================\n";
+printf "  Solve status       : %s\n", solve_result;
+printf "  Objective (revenue): %.2f EUR\n", Revenue;
+printf "================================================================\n\n";
+
+# ----- Detailed schedule (all quarters) -----
+printf "================================================================\n";
+printf "  DETAILED SCHEDULE (all 96 quarters)\n";
+printf "================================================================\n";
+printf "  Hr  Q   lambda    charge    dischg       SoC   mode\n";
+printf "  -- --  -------  --------  --------  --------  -----\n";
+
+for {h in HOURS, s in QUARTERS} {
+    printf "  %2d  %1d  %7.2f  %8.3f  %8.3f  %8.3f    %s\n",
+        h, s, lambda[h,s], c[h,s], d[h,s], E[h,s],
+        if z[h,s] > 0.5 then "DIS" else "CHG";
+}
+
+printf "\n";
+
+# ----- Optional: full SoC trajectory for plotting -----
+# Uncomment the block below to print the full 96-period state trajectory
+#
+# printf "================================================================\n";
+# printf "  FULL SoC TRAJECTORY (all 96 quarters)\n";
+# printf "================================================================\n";
+# printf "  Hr  Q   lambda       SoC\n";
+# printf "  -- --  -------  --------\n";
+# for {h in HOURS, s in QUARTERS} {
+#     printf "  %2d  %1d  %7.2f  %8.3f\n", h, s, lambda[h,s], E[h,s];
+# }
+
+# ----- Export to CSV for plotting (optional) -----
+# Uncomment to dump the full schedule into a CSV file
+#
+# printf "hour,quarter,lambda,charge_MWh,discharge_MWh,SoC_MWh,is_discharging\n"
+#     > "schedule.csv";
+# for {h in HOURS, s in QUARTERS} {
+#     printf "%d,%d,%.4f,%.6f,%.6f,%.6f,%d\n",
+#         h, s, lambda[h,s], c[h,s], d[h,s], E[h,s],
+#         if z[h,s] > 0.5 then 1 else 0
+#         > "schedule.csv";
+# }
+# close "schedule.csv";
+# printf "Schedule exported to schedule.csv\n";
