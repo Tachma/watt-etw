@@ -50,7 +50,9 @@ RAE_ASSETS_CACHE = Path("data/external/rae/assets.parquet")
 # More assets ⇒ more Open-Meteo calls (one per unique lat/lon × day range).
 # Top-by-capacity gives a representative weighted aggregate without thrashing
 # the API. Set to None to use them all.
-RAE_TOP_PER_TECH = 25
+# 10 per technology = up to 50 unique locations — safe for the free tier
+# with the 2 s inter-asset sleep added in fetch_for_assets.
+RAE_TOP_PER_TECH = 10
 
 
 # --------------------------------------------------------------------------- #
@@ -214,7 +216,7 @@ def _print_train_metrics(metrics, model_dir: str) -> None:
     print("\n-- Holdout test metrics (last 30 days) --")
     print(f"MAE  : {metrics.mae:.2f} EUR/MWh")
     print(f"RMSE : {metrics.rmse:.2f} EUR/MWh")
-    print(f"MAPE : {metrics.mape:.1f}%  (prices ≥ 5 EUR/MWh)")
+    print(f"MAPE : {metrics.mape:.1f}%  (prices >= 5 EUR/MWh)")
     print(f"N    : {metrics.n_samples} rows")
     print(f"\nModel saved to: {model_dir}/")
 

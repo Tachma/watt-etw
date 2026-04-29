@@ -5,11 +5,20 @@ Forecast data (future days): uses the Open-Meteo Forecast API — free tier up
   to 16 days ahead, no key needed for the variables we use.
 
 Results are cached per calendar day as JSON under data/external/weather/.
+
+Rate-limit handling
+-------------------
+The free Open-Meteo Archive API enforces a per-minute request rate.  When a
+429 response is received, ``_fetch_range`` waits ``retry_delay`` seconds and
+retries up to ``max_retries`` times (delay doubles on each attempt).
+``fetch_for_assets`` also inserts a small inter-asset sleep so that a fleet
+of 100+ assets doesn't fire requests in a tight loop.
 """
 from __future__ import annotations
 
 import json
 import logging
+import time
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
@@ -77,8 +86,14 @@ def _fetch_range(
     lon: float = _LON,
     tilt: float = 30.0,
     azimuth: float = 0.0,
+    max_retries: int = 4,
+    retry_delay: float = 12.0,
 ) -> dict[str, Any]:
-    """Fetch a date range in one API call. Returns raw Open-Meteo JSON."""
+    """Fetch a date range in one API call. Returns raw Open-Meteo JSON.
+
+    Retries up to *max_retries* times on HTTP 429 (Too Many Requests),
+    doubling *retry_delay* on each attempt.
+    """
     url = _FORECAST_URL if forecast else _ARCHIVE_URL
     params = {
         "latitude": lat,
@@ -90,9 +105,24 @@ def _fetch_range(
         "tilt": tilt,
         "azimuth": azimuth,
     }
-    resp = requests.get(url, params=params, timeout=30)
-    resp.raise_for_status()
-    return resp.json()
+    delay = retry_delay
+    for attempt in range(max_retries + 1):
+        resp = requests.get(url, params=params, timeout=60)
+        if resp.status_code == 429:
+            if attempt < max_retries:
+                logger.warning(
+                    "Open-Meteo 429 for (%.4f, %.4f) — waiting %.0fs before retry %d/%d",
+                    lat, lon, delay, attempt + 1, max_retries,
+                )
+                time.sleep(delay)
+                delay *= 2
+                continue
+            # exhausted retries
+            resp.raise_for_status()
+        resp.raise_for_status()
+        return resp.json()
+    # should never reach here
+    raise RuntimeError("_fetch_range: exceeded retry limit")
 
 
 def _split_by_day(raw: dict[str, Any]) -> dict[date, dict[str, Any]]:
@@ -217,28 +247,67 @@ def fetch_for_assets(
     force: bool = False,
     tilt: float = 30.0,
     azimuth: float = 0.0,
+    inter_asset_sleep: float = 2.0,
 ) -> pd.DataFrame:
     """Fetch hourly weather for each RAE asset coordinate.
 
     assets_df must include technology, latitude, and longitude. capacity_mw is
     optional and is carried through for weighted aggregation.
+
+    Coordinates are deduplicated (rounded to 3 decimal places) so assets that
+    share a grid cell share a single API call.  A small sleep of
+    *inter_asset_sleep* seconds is inserted between each uncached fetch to
+    stay within the Open-Meteo free-tier rate limit.
     """
+    df = assets_df.reset_index(drop=True).copy()
+
+    # Round to 3 dp (~100 m grid) for deduplication purposes.
+    df["_lat_r"] = df["latitude"].astype(float).round(3)
+    df["_lon_r"] = df["longitude"].astype(float).round(3)
+
+    # Track which unique (lat, lon) pairs have already been fetched this run
+    # so we can reuse the DataFrame instead of making a duplicate API call.
+    coord_cache: dict[tuple[float, float], pd.DataFrame] = {}
+
     records: list[pd.DataFrame] = []
-    for index, asset in assets_df.reset_index(drop=True).iterrows():
-        weather = fetch(
-            start_date,
-            end_date,
-            lat=float(asset["latitude"]),
-            lon=float(asset["longitude"]),
-            tilt=tilt,
-            azimuth=azimuth,
-            cache_dir=cache_dir,
-            force=force,
-        )
+    for index, asset in df.iterrows():
+        lat = float(asset["_lat_r"])
+        lon = float(asset["_lon_r"])
+        coord_key = (lat, lon)
+
+        if coord_key in coord_cache:
+            weather = coord_cache[coord_key].copy()
+            needs_fetch = False
+        else:
+            # Check whether all days are already on disk to skip the sleep.
+            cache_root = Path(cache_dir)
+            all_cached = all(
+                _cache_path(start_date + timedelta(days=i), lat, lon).exists()
+                for i in range((end_date - start_date).days + 1)
+            ) and not force
+
+            weather = fetch(
+                start_date,
+                end_date,
+                lat=lat,
+                lon=lon,
+                tilt=tilt,
+                azimuth=azimuth,
+                cache_dir=cache_dir,
+                force=force,
+            )
+            coord_cache[coord_key] = weather.copy()
+            needs_fetch = not all_cached
+
         weather["asset_id"] = index
         weather["technology"] = asset["technology"]
         weather["capacity_mw"] = asset.get("capacity_mw")
         records.append(weather)
+
+        if needs_fetch and inter_asset_sleep > 0:
+            logger.debug("Sleeping %.1fs between asset fetches", inter_asset_sleep)
+            time.sleep(inter_asset_sleep)
+
     if not records:
         return pd.DataFrame()
     return pd.concat(records, ignore_index=True)
