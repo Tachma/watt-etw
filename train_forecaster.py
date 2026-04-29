@@ -45,6 +45,7 @@ def run(force: bool = False, eval_only: bool = False) -> None:
     from watt_etw.data.henex_parser import load_or_parse
     from watt_etw.data.ttf_fetcher import load as load_ttf
     from watt_etw.data.weather_fetcher import fetch as fetch_weather
+    from watt_etw.data.admie_fetcher import fetch as fetch_admie
     from watt_etw.features.feature_builder import load_or_build
     from watt_etw.forecasting.price_forecaster import PriceForecaster
 
@@ -55,7 +56,7 @@ def run(force: bool = False, eval_only: bool = False) -> None:
         logger.info("Loading features from cache (eval-only mode)")
         features = pd.read_parquet(FEATURES_CACHE)
     else:
-        logger.info("Step 1/4 — Parsing HENEX files")
+        logger.info("Step 1/5 — Parsing HENEX files")
         prices = load_or_parse(
             *HENEX_DIRS,
             cache_path=PRICES_CACHE,
@@ -67,15 +68,19 @@ def run(force: bool = False, eval_only: bool = False) -> None:
         end = prices["date"].max().date()
         logger.info("Price data: %s → %s (%d days)", start, end, prices["date"].nunique())
 
-        logger.info("Step 2/4 — Loading TTF gas prices")
+        logger.info("Step 2/5 — Loading TTF gas prices")
         ttf = load_ttf(start, end)
 
-        logger.info("Step 3/4 — Fetching weather data (cached per day)")
+        logger.info("Step 3/5 — Fetching weather data (cached per day)")
         weather = fetch_weather(start, end)
 
-        logger.info("Step 4/4 — Building feature matrix")
+        logger.info("Step 4/5 — Fetching ADMIE ISP1 load & RES forecasts")
+        admie = fetch_admie(start, end)
+
+        logger.info("Step 5/5 — Building feature matrix")
         features = load_or_build(
             prices, weather, ttf,
+            admie_df=admie,
             cache_path=FEATURES_CACHE,
             force=force,
         )
@@ -106,13 +111,13 @@ def _print_metrics_from_train(metrics: dict) -> None:
     import pandas as pd
     rows = [{"hour": h, **m.to_dict()} for h, m in metrics.items()]
     df = pd.DataFrame(rows).set_index("hour")
-    print("\n── Per-hour test metrics (last 30 days) ──")
+    print("\n-- Per-hour test metrics (last 30 days) --")
     print(df[["mae", "rmse", "mape"]].round(2).to_string())
     valid_mae = df["mae"].dropna()
     valid_mape = df["mape"].dropna()
     valid_mape = valid_mape[valid_mape < 1000]  # ignore near-zero price artefacts
     print(f"\nOverall MAE : {valid_mae.mean():.2f} EUR/MWh")
-    print(f"Overall MAPE: {valid_mape.mean():.1f}%  (prices ≥5 EUR/MWh only)")
+    print(f"Overall MAPE: {valid_mape.mean():.1f}%  (prices >=5 EUR/MWh only)")
     print(f"Models saved to: {MODEL_DIR}/")
 
 
@@ -122,7 +127,7 @@ def _print_metrics(eval_df: pd.DataFrame) -> None:
         .agg(mae=("abs_error", "mean"), rmse=("error", lambda x: (x**2).mean()**0.5))
         .round(2)
     )
-    print("\n── Per-hour evaluation metrics ──")
+    print("\n-- Per-hour evaluation metrics --")
     print(summary.to_string())
     print(f"\nOverall MAE: {eval_df['abs_error'].mean():.2f} EUR/MWh")
 

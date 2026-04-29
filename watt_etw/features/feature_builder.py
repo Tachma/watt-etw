@@ -1,4 +1,4 @@
-"""Build the feature matrix by joining HENEX prices, TTF gas, and weather.
+"""Build the feature matrix by joining HENEX prices, TTF gas, weather, and ADMIE forecasts.
 
 weather_df can be the single-location output of weather_fetcher.fetch, or a
 technology-level RES weather table from weather_fetcher.fetch_renewable_weather_features.
@@ -18,6 +18,9 @@ Output schema (one row per date-hour):
     relative_humidity_2m, precipitation
     -- gas --
     ttf_eur_mwh, ttf_lag1d, ttf_lag7d
+    -- ADMIE ISP1 day-ahead forecasts --
+    load_forecast_mw, res_forecast_mw,
+    load_res_ratio, net_load_forecast_mw
     -- target --
     mcp_eur_mwh
 """
@@ -50,6 +53,7 @@ def build(
     prices_df: pd.DataFrame,
     weather_df: pd.DataFrame,
     ttf_df: pd.DataFrame,
+    admie_df: pd.DataFrame | None = None,
     cache_path: str | Path | None = "data/processed/features.parquet",
 ) -> pd.DataFrame:
     """Join all sources and engineer features.  Returns the feature DataFrame.
@@ -58,6 +62,7 @@ def build(
         prices_df:  Output of henex_parser.parse_all / load_or_parse.
         weather_df: Output of weather_fetcher.fetch.
         ttf_df:     Output of ttf_fetcher.fetch.
+        admie_df:   Output of admie_fetcher.fetch (optional).
         cache_path: If given, write the result to parquet at this path.
     """
     # ------------------------------------------------------------------ #
@@ -123,6 +128,22 @@ def build(
     df = df.merge(ttf, on="date", how="left")
 
     # ------------------------------------------------------------------ #
+    # 5b. ADMIE ISP1 forecasts (optional)                                  #
+    # ------------------------------------------------------------------ #
+    if admie_df is not None and not admie_df.empty:
+        admie = admie_df.copy()
+        admie["date"] = pd.to_datetime(admie["date"])
+        admie["load_forecast_mw"] = pd.to_numeric(admie["load_forecast_mw"], errors="coerce")
+        admie["res_forecast_mw"] = pd.to_numeric(admie["res_forecast_mw"], errors="coerce")
+        df = df.merge(admie[["date", "hour", "load_forecast_mw", "res_forecast_mw"]],
+                      on=["date", "hour"], how="left")
+        # Derived: net load and penetration ratio
+        df["net_load_forecast_mw"] = df["load_forecast_mw"] - df["res_forecast_mw"]
+        df["load_res_ratio"] = (
+            df["res_forecast_mw"] / df["load_forecast_mw"].replace(0, float("nan"))
+        )
+
+    # ------------------------------------------------------------------ #
     # 6. Drop helper columns and reorder                                   #
     # ------------------------------------------------------------------ #
     df = df.drop(columns=["_idx"], errors="ignore")
@@ -141,6 +162,8 @@ def build(
         "cloud_cover", "relative_humidity_2m", "precipitation",
         # gas
         "ttf_eur_mwh", "ttf_lag1d", "ttf_lag7d",
+        # ADMIE ISP1 forecasts
+        "load_forecast_mw", "res_forecast_mw", "net_load_forecast_mw", "load_res_ratio",
         # target
         "mcp_eur_mwh",
     ]
@@ -167,6 +190,7 @@ def load_or_build(
     prices_df: pd.DataFrame,
     weather_df: pd.DataFrame,
     ttf_df: pd.DataFrame,
+    admie_df: pd.DataFrame | None = None,
     cache_path: str | Path = "data/processed/features.parquet",
     force: bool = False,
 ) -> pd.DataFrame:
@@ -175,4 +199,4 @@ def load_or_build(
     if cache_path.exists() and not force:
         logger.info("Loading features from cache: %s", cache_path)
         return pd.read_parquet(cache_path)
-    return build(prices_df, weather_df, ttf_df, cache_path=cache_path)
+    return build(prices_df, weather_df, ttf_df, admie_df=admie_df, cache_path=cache_path)
