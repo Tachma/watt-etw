@@ -1,7 +1,33 @@
 import React, { useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { BatteryCharging, CheckCircle2, FileUp, Play, Plus, Trash2 } from "lucide-react";
+import {
+  BatteryCharging,
+  CalendarDays,
+  CheckCircle2,
+  FileUp,
+  Gauge,
+  Play,
+  Plus,
+  Trash2,
+  UploadCloud
+} from "lucide-react";
 import "./styles.css";
+
+async function parseJsonResponse(response, fallbackMessage) {
+  const text = await response.text();
+  if (!text) {
+    if (response.ok) return {};
+    throw new Error(
+      `${fallbackMessage} (HTTP ${response.status}${response.statusText ? ` ${response.statusText}` : ""}). ` +
+      `Is the backend running on port 8000? Run: uvicorn watt_etw.api.main:app --reload`
+    );
+  }
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new Error(`${fallbackMessage}: server returned non-JSON body — ${text.slice(0, 200)}`);
+  }
+}
 
 const defaultBattery = (index = 1) => ({
   name: `Battery ${index}`,
@@ -11,6 +37,11 @@ const defaultBattery = (index = 1) => ({
   availability: 100,
   ramp: 25
 });
+
+const previewBars = [
+  34, 30, 28, 32, 39, 55, 72, 69, 58, 46, 42, 48,
+  61, 70, 74, 63, 52, 49, 57, 76, 82, 67, 50, 38
+];
 
 function App() {
   const [step, setStep] = useState("landing");
@@ -38,7 +69,8 @@ function App() {
         method: "POST",
         body: formData
       });
-      const data = await response.json();
+      const data = await parseJsonResponse(response, "Could not validate file");
+      if (!response.ok) throw new Error(data.detail || "Could not validate file.");
       setValidation(data);
       if (data.detected_dates?.length) {
         setSelectedDate(data.detected_dates[0]);
@@ -66,7 +98,7 @@ function App() {
           selected_date: selectedDate
         })
       });
-      const data = await response.json();
+      const data = await parseJsonResponse(response, "Optimization failed");
       if (!response.ok) throw new Error(data.detail || "Optimization failed.");
       setResult(data);
       setStep("results");
@@ -100,30 +132,16 @@ function App() {
           <span className="mark"><BatteryCharging size={18} /> Watt ETW</span>
           <h1>Battery Fleet Optimization</h1>
         </div>
-        <nav>
-          <button onClick={() => setStep("fleet")}>Fleet</button>
-          <button onClick={() => setStep("import")}>Import</button>
-          <button disabled={!result} onClick={() => setStep("results")}>Results</button>
+        <nav aria-label="Workflow">
+          <button className={step === "fleet" ? "active" : ""} onClick={() => setStep("fleet")}>Fleet</button>
+          <button className={step === "import" ? "active" : ""} onClick={() => setStep("import")}>Import</button>
+          <button className={step === "results" ? "active" : ""} disabled={!result} onClick={() => setStep("results")}>Results</button>
         </nav>
       </header>
 
       {error && <div className="alert">{error}</div>}
 
-      {step === "landing" && (
-        <section className="hero">
-          <div>
-            <p className="eyebrow">Greek DAM battery arbitrage</p>
-            <h2>Turn HEnEx market data into a feasible battery schedule.</h2>
-            <p>
-              Configure a battery fleet, upload HEnEx-style market data, and calculate profit,
-              revenue, operating cost, SOC, and charge/discharge actions.
-            </p>
-            <button className="primary" onClick={() => setStep("fleet")}>
-              <Play size={18} /> Start Optimization
-            </button>
-          </div>
-        </section>
-      )}
+      {step === "landing" && <Landing onStart={() => setStep("fleet")} />}
 
       {step === "fleet" && (
         <section>
@@ -185,6 +203,63 @@ function App() {
         <Results result={result} rows={selectedRows} exportSchedule={exportSchedule} />
       )}
     </main>
+  );
+}
+
+function Landing({ onStart }) {
+  return (
+    <section className="landing">
+      <div className="hero">
+        <div className="heroCopy">
+          <p className="eyebrow">Greek DAM battery arbitrage</p>
+          <h2>From HEnEx DAM prices to a battery dispatch schedule in minutes.</h2>
+          <p>
+            Configure a battery fleet, upload HEnEx-style market data, and calculate a feasible
+            charge/discharge plan with profit, cost, and SOC.
+          </p>
+          <div className="heroActions">
+            <button className="primary" onClick={onStart}>
+              <Play size={18} /> Start Optimization
+            </button>
+          </div>
+        </div>
+        <MarketPreview />
+      </div>
+    </section>
+  );
+}
+
+function MarketPreview() {
+  return (
+    <div className="marketPreview" aria-label="Example optimization preview">
+      <div className="previewHeader">
+        <div>
+          <span>Optimization preview</span>
+          <strong>DAM price signal</strong>
+        </div>
+        <span className="liveTag">Ready</span>
+      </div>
+      <div className="previewStats">
+        <span><Gauge size={16} /> Price spread <strong>54.2 EUR/MWh</strong></span>
+        <span><BatteryCharging size={16} /> Final SOC <strong>38 MWh</strong></span>
+      </div>
+      <div className="priceWindow">
+        {previewBars.map((value, index) => {
+          const action = index < 6 ? "charge" : index > 18 && index < 22 ? "discharge" : "";
+          return (
+            <span
+              className={`priceBar ${action}`}
+              key={`${value}-${index}`}
+              style={{ "--height": `${value}%` }}
+            />
+          );
+        })}
+      </div>
+      <div className="previewFooter">
+        <span><UploadCloud size={15} /> HEnEx-style upload</span>
+        <span><CalendarDays size={15} /> Daily schedule</span>
+      </div>
+    </div>
   );
 }
 
@@ -326,11 +401,11 @@ function Kpi({ label, value }) {
 
 function Sparkline({ rows }) {
   const points = rows.map((row) => Number(row.price_eur_mwh));
-  return <Line points={points} color="#2563eb" />;
+  return <Line points={points} color="var(--blue)" />;
 }
 
 function SocLine({ schedule }) {
-  return <Line points={schedule.map((row) => Number(row.soc_mwh))} color="#059669" />;
+  return <Line points={schedule.map((row) => Number(row.soc_mwh))} color="var(--green)" />;
 }
 
 function ActionBars({ schedule }) {

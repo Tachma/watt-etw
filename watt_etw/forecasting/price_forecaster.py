@@ -27,7 +27,10 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
-# Features used for training (must exist in the feature matrix)
+# Core features used for training. Per-technology RES weather columns
+# (e.g. wind_wind_speed_120m) are picked up dynamically at train() time
+# via _RES_FEATURE_PREFIXES so the model uses whatever the asset/weather
+# pipeline produced without a hard-coded list.
 _FEATURE_COLS = [
     "mcp_lag1h", "mcp_lag2h", "mcp_lag24h", "mcp_lag48h", "mcp_lag168h",
     "mcp_rolling_mean_24h", "mcp_rolling_std_24h",
@@ -36,7 +39,9 @@ _FEATURE_COLS = [
     "temperature_2m", "shortwave_radiation", "wind_speed_10m",
     "cloud_cover", "relative_humidity_2m", "precipitation",
     "ttf_eur_mwh", "ttf_lag1d", "ttf_lag7d",
+    "eua_eur_t", "eua_lag1d", "eua_lag7d",
 ]
+_RES_FEATURE_PREFIXES = ("wind_", "solar_", "hydro_", "hybrid_", "wind_turbine_")
 _TARGET_COL = "mcp_eur_mwh"
 
 _DEFAULT_LGB_PARAMS: dict[str, Any] = {
@@ -109,11 +114,21 @@ class PriceForecaster:
         df["date"] = pd.to_datetime(df["date"])
         df = df.sort_values(["date", "hour"]).reset_index(drop=True)
 
-        # Determine which feature columns are actually present
-        self._feature_cols = [c for c in _FEATURE_COLS if c in df.columns]
-        missing = set(_FEATURE_COLS) - set(self._feature_cols)
+        # Determine which feature columns are actually present.
+        # Includes the explicit core list plus any RES-prefixed columns produced
+        # by weather_fetcher.fetch_renewable_weather_features().
+        core_present = [c for c in _FEATURE_COLS if c in df.columns]
+        res_present = [
+            c for c in df.columns
+            if c.startswith(_RES_FEATURE_PREFIXES) and c not in core_present
+            and c not in {"date", "hour", _TARGET_COL}
+        ]
+        self._feature_cols = core_present + res_present
+        missing = set(_FEATURE_COLS) - set(core_present)
         if missing:
             logger.warning("Missing feature columns (will be skipped): %s", missing)
+        if res_present:
+            logger.info("Using %d per-tech RES weather features", len(res_present))
 
         # Train/test split on dates (never shuffle time series)
         cutoff_date = df["date"].max() - pd.Timedelta(days=self.test_days)

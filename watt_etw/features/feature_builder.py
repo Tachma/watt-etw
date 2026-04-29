@@ -1,8 +1,12 @@
-"""Build the feature matrix by joining HENEX prices, TTF gas, and weather.
+"""Build the feature matrix by joining HENEX prices, TTF gas, EUA carbon, and weather.
 
-weather_df can be the single-location output of weather_fetcher.fetch, or a
-technology-level RES weather table from weather_fetcher.fetch_renewable_weather_features.
-Extra weather columns are preserved after the date/hour merge.
+`weather_df` is the single-location baseline (e.g. weather_fetcher.fetch for Athens).
+`res_weather_df` is the optional technology-aggregated RES weather table from
+weather_fetcher.fetch_renewable_weather_features(); when provided, its per-tech
+columns (e.g. wind_wind_speed_120m, solar_global_tilted_irradiance) are merged
+on date/hour alongside the baseline weather.
+
+`carbon_df` is the optional output of carbon_fetcher.fetch (daily eua_eur_t).
 
 Output schema (one row per date-hour):
     date, hour
@@ -13,11 +17,15 @@ Output schema (one row per date-hour):
     sell_total_mwh, gas_mwh, hydro_mwh, res_mwh, lignite_mwh, imports_mwh
     -- calendar --
     day_of_week, month, hour_of_day, is_weekend, is_holiday_gr
-    -- weather (Athens) --
+    -- weather (Athens baseline) --
     temperature_2m, shortwave_radiation, wind_speed_10m, cloud_cover,
     relative_humidity_2m, precipitation
+    -- per-tech RES weather (if res_weather_df given) --
+    wind_*, hydro_*, hybrid_*, ... (capacity-weighted by technology)
     -- gas --
     ttf_eur_mwh, ttf_lag1d, ttf_lag7d
+    -- carbon (if carbon_df given) --
+    eua_eur_t, eua_lag1d, eua_lag7d
     -- target --
     mcp_eur_mwh
 """
@@ -50,16 +58,11 @@ def build(
     prices_df: pd.DataFrame,
     weather_df: pd.DataFrame,
     ttf_df: pd.DataFrame,
+    res_weather_df: pd.DataFrame | None = None,
+    carbon_df: pd.DataFrame | None = None,
     cache_path: str | Path | None = "data/processed/features.parquet",
 ) -> pd.DataFrame:
-    """Join all sources and engineer features.  Returns the feature DataFrame.
-
-    Args:
-        prices_df:  Output of henex_parser.parse_all / load_or_parse.
-        weather_df: Output of weather_fetcher.fetch.
-        ttf_df:     Output of ttf_fetcher.fetch.
-        cache_path: If given, write the result to parquet at this path.
-    """
+    """Join all sources and engineer features. Returns the feature DataFrame."""
     # ------------------------------------------------------------------ #
     # 1. Normalise date types to datetime for consistent merging           #
     # ------------------------------------------------------------------ #
@@ -77,18 +80,11 @@ def build(
     # ------------------------------------------------------------------ #
     prices = prices.sort_values(["date", "hour"]).reset_index(drop=True)
 
-    # Flat index for lag arithmetic
-    prices["_idx"] = prices.index
-    mcp = prices["mcp_eur_mwh"].values
-
-    def _lag(n: int) -> pd.Series:
-        return prices["mcp_eur_mwh"].shift(n)
-
-    prices["mcp_lag1h"] = _lag(1)
-    prices["mcp_lag2h"] = _lag(2)
-    prices["mcp_lag24h"] = _lag(24)
-    prices["mcp_lag48h"] = _lag(48)
-    prices["mcp_lag168h"] = _lag(168)  # one week back
+    prices["mcp_lag1h"] = prices["mcp_eur_mwh"].shift(1)
+    prices["mcp_lag2h"] = prices["mcp_eur_mwh"].shift(2)
+    prices["mcp_lag24h"] = prices["mcp_eur_mwh"].shift(24)
+    prices["mcp_lag48h"] = prices["mcp_eur_mwh"].shift(48)
+    prices["mcp_lag168h"] = prices["mcp_eur_mwh"].shift(168)
 
     prices["mcp_rolling_mean_24h"] = (
         prices["mcp_eur_mwh"].shift(1).rolling(24, min_periods=12).mean()
@@ -103,7 +99,7 @@ def build(
     years = sorted(prices["date"].dt.year.unique().tolist())
     gr_holidays = _greek_holidays(years)
 
-    prices["day_of_week"] = prices["date"].dt.dayofweek   # 0=Mon
+    prices["day_of_week"] = prices["date"].dt.dayofweek
     prices["month"] = prices["date"].dt.month
     prices["hour_of_day"] = prices["hour"]
     prices["is_weekend"] = (prices["day_of_week"] >= 5).astype(int)
@@ -117,31 +113,49 @@ def build(
     ttf["ttf_lag7d"] = ttf["ttf_eur_mwh"].shift(7)
 
     # ------------------------------------------------------------------ #
-    # 5. Merge                                                             #
+    # 5. Merge prices with weather + TTF                                   #
     # ------------------------------------------------------------------ #
     df = prices.merge(weather, on=["date", "hour"], how="left")
+
+    if res_weather_df is not None and not res_weather_df.empty:
+        res = res_weather_df.copy()
+        res["date"] = pd.to_datetime(res["date"])
+        # Avoid clashing column names with the baseline weather merge.
+        overlap = (set(res.columns) - {"date", "hour"}) & set(df.columns)
+        if overlap:
+            logger.warning(
+                "res_weather_df shares %d cols with baseline weather; dropping from RES side: %s",
+                len(overlap), sorted(overlap),
+            )
+            res = res.drop(columns=list(overlap))
+        df = df.merge(res, on=["date", "hour"], how="left")
+
     df = df.merge(ttf, on="date", how="left")
 
     # ------------------------------------------------------------------ #
-    # 6. Drop helper columns and reorder                                   #
+    # 6. Carbon lags + merge                                               #
     # ------------------------------------------------------------------ #
-    df = df.drop(columns=["_idx"], errors="ignore")
+    if carbon_df is not None and not carbon_df.empty:
+        carbon = carbon_df.copy()
+        carbon["date"] = pd.to_datetime(carbon["date"])
+        carbon = carbon.sort_values("date").reset_index(drop=True)
+        carbon["eua_lag1d"] = carbon["eua_eur_t"].shift(1)
+        carbon["eua_lag7d"] = carbon["eua_eur_t"].shift(7)
+        df = df.merge(carbon, on="date", how="left")
 
+    # ------------------------------------------------------------------ #
+    # 7. Reorder                                                           #
+    # ------------------------------------------------------------------ #
     col_order = [
         "date", "hour",
-        # lags
         "mcp_lag1h", "mcp_lag2h", "mcp_lag24h", "mcp_lag48h", "mcp_lag168h",
         "mcp_rolling_mean_24h", "mcp_rolling_std_24h",
-        # supply mix
         "sell_total_mwh", "gas_mwh", "hydro_mwh", "res_mwh", "lignite_mwh", "imports_mwh",
-        # calendar
         "day_of_week", "month", "hour_of_day", "is_weekend", "is_holiday_gr",
-        # weather
         "temperature_2m", "shortwave_radiation", "wind_speed_10m",
         "cloud_cover", "relative_humidity_2m", "precipitation",
-        # gas
         "ttf_eur_mwh", "ttf_lag1d", "ttf_lag7d",
-        # target
+        "eua_eur_t", "eua_lag1d", "eua_lag7d",
         "mcp_eur_mwh",
     ]
     existing = [c for c in col_order if c in df.columns]
@@ -167,6 +181,8 @@ def load_or_build(
     prices_df: pd.DataFrame,
     weather_df: pd.DataFrame,
     ttf_df: pd.DataFrame,
+    res_weather_df: pd.DataFrame | None = None,
+    carbon_df: pd.DataFrame | None = None,
     cache_path: str | Path = "data/processed/features.parquet",
     force: bool = False,
 ) -> pd.DataFrame:
@@ -175,4 +191,11 @@ def load_or_build(
     if cache_path.exists() and not force:
         logger.info("Loading features from cache: %s", cache_path)
         return pd.read_parquet(cache_path)
-    return build(prices_df, weather_df, ttf_df, cache_path=cache_path)
+    return build(
+        prices_df,
+        weather_df,
+        ttf_df,
+        res_weather_df=res_weather_df,
+        carbon_df=carbon_df,
+        cache_path=cache_path,
+    )
