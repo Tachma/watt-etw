@@ -20,6 +20,8 @@ dependencies = [
     "holidays>=0.40",
     # Optional: TTF/EUA fallback via Yahoo Finance
     "yfinance>=0.2",
+    # Optimisation (MILP)
+    "pulp>=2.8",
 ]
 
 [project.optional-dependencies]
