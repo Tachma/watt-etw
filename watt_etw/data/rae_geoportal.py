@@ -20,10 +20,11 @@ except ImportError:  # pragma: no cover - pandas is used by the feature pipeline
 WFS_URL = "https://geo.rae.gr/geoserver/ows"
 
 DEFAULT_RES_LAYERS = {
-    "wind": "rae_status:V_SDI_R_AIOLIKA_ALL",
+    "wind":         "rae_status:V_SDI_R_AIOLIKA_ALL",
     "wind_turbine": "rae_status:V_SDI_R_ANEMOGENNHTRIES11",
-    "hydro": "rae_status:V_HYDRO_GROUPED_ALL",
-    "hybrid": "rae_status:V_SDI_ISLANDS_HYB_OTHERVALUES",
+    "solar":        "rae_status:V_SDI_R_SOLAR_ALL",
+    "hydro":        "rae_status:V_HYDRO_GROUPED_ALL",
+    "hybrid":       "rae_status:V_SDI_ISLANDS_HYB_OTHERVALUES",
 }
 
 CAPACITY_HINTS = (
