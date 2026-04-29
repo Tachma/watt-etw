@@ -29,6 +29,8 @@ EUA) are broadcast across all 96 MTUs of the day.
     eua_eur_t, eua_lag1d, eua_lag7d
     -- ADMIE ISP1 day-ahead forecasts --
     load_forecast_mw, res_forecast_mw, load_res_ratio, net_load_forecast_mw
+    -- peak-hour helpers --
+    temp_dev_from_climatology, net_load_vs_daily_max, mcp_range_24h
     -- target --
     mcp_eur_mwh
 """
@@ -108,6 +110,41 @@ def _broadcast_hourly_to_mtu(df_h: pd.DataFrame) -> pd.DataFrame:
         tmp["mtu"] = tmp["hour"] * 4 + q
         rows.append(tmp.drop(columns=["hour"]))
     return pd.concat(rows, ignore_index=True)
+
+
+def _add_peak_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Derive features that help the model during peak/scarcity hours.
+
+    - temp_dev_from_climatology: temperature_2m minus the (month, hour) mean
+      across the dataset. Negative ⇒ colder than typical, a heating-demand
+      proxy that flags evening cold snaps the model otherwise misses.
+    - net_load_vs_daily_max: net_load / max(net_load) on the same date. 1.0
+      at the day's peak, helps the model condition on "we're at peak now".
+    - mcp_range_24h: trailing 24-hour MCP max minus min, shifted by 1 step
+      to avoid leakage. A volatility-regime indicator — wide spread days
+      tend to have steeper evening peaks.
+    """
+    out = df
+
+    if "temperature_2m" in out.columns:
+        clim = out.groupby(["month", "hour"])["temperature_2m"].transform("mean")
+        out["temp_dev_from_climatology"] = out["temperature_2m"] - clim
+
+    if "net_load_forecast_mw" in out.columns:
+        daily_max = out.groupby("date")["net_load_forecast_mw"].transform("max")
+        out["net_load_vs_daily_max"] = (
+            out["net_load_forecast_mw"] / daily_max.replace(0, float("nan"))
+        )
+
+    if "mcp_eur_mwh" in out.columns:
+        out = out.sort_values(["date", "mtu"]).reset_index(drop=True)
+        shifted = out["mcp_eur_mwh"].shift(1)
+        out["mcp_range_24h"] = (
+            shifted.rolling(96, min_periods=48).max()
+            - shifted.rolling(96, min_periods=48).min()
+        )
+
+    return out
 
 
 def build(
@@ -228,6 +265,11 @@ def build(
         df = df.merge(carbon, on="date", how="left")
 
     # ------------------------------------------------------------------ #
+    # 6b. Peak-hour helper features                                        #
+    # ------------------------------------------------------------------ #
+    df = _add_peak_features(df)
+
+    # ------------------------------------------------------------------ #
     # 7. Reorder                                                           #
     # ------------------------------------------------------------------ #
     col_order = [
@@ -243,6 +285,7 @@ def build(
         "eua_eur_t", "eua_lag1d", "eua_lag7d",
         "load_forecast_mw", "res_forecast_mw",
         "net_load_forecast_mw", "load_res_ratio",
+        "temp_dev_from_climatology", "net_load_vs_daily_max", "mcp_range_24h",
         "mcp_eur_mwh",
     ]
     existing = [c for c in col_order if c in df.columns]

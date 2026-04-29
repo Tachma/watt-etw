@@ -53,6 +53,8 @@ _CORE_FEATURES = [
     # ADMIE forecasts
     "load_forecast_mw", "res_forecast_mw",
     "net_load_forecast_mw", "load_res_ratio",
+    # Peak-hour helpers
+    "temp_dev_from_climatology", "net_load_vs_daily_max", "mcp_range_24h",
 ]
 _RES_FEATURE_PREFIXES = ("wind_", "solar_", "hydro_", "hybrid_", "wind_turbine_")
 _TARGET_COL = "mcp_eur_mwh"
@@ -107,10 +109,16 @@ class PriceForecaster:
         model_dir: str | Path = "models/price_forecaster",
         test_days: int = 30,
         lgb_params: dict[str, Any] | None = None,
+        peak_hours: tuple[int, ...] = (16, 17, 18, 19),
+        peak_weight: float = 1.0,
     ):
         self.model_dir = Path(model_dir)
         self.test_days = test_days
         self.lgb_params = lgb_params or _DEFAULT_LGB_PARAMS.copy()
+        # peak_weight=1.0 disables weighting (default). Set >1.0 (e.g. 3.0)
+        # to bias the fit toward evening-peak rows.
+        self.peak_hours = tuple(peak_hours)
+        self.peak_weight = float(peak_weight)
         self._model: Any = None
         self._feature_cols: list[str] = []
 
@@ -186,9 +194,21 @@ class PriceForecaster:
         X_te = test_df[self._feature_cols].values
         y_te = test_df[_TARGET_COL].values
 
+        # Optional sample weighting: bias the fit toward peak hours where
+        # MAE is largest. peak_weight==1.0 → no change.
+        weights = None
+        if self.peak_weight != 1.0 and "hour" in train_df.columns:
+            is_peak = train_df["hour"].isin(self.peak_hours).values
+            weights = np.where(is_peak, self.peak_weight, 1.0)
+            logger.info(
+                "Peak weighting: %d/%d rows in peak hours %s @ %.2f×",
+                int(is_peak.sum()), len(is_peak), self.peak_hours, self.peak_weight,
+            )
+
         model = lgb.LGBMRegressor(**self.lgb_params)
         model.fit(
             X_tr, y_tr,
+            sample_weight=weights,
             eval_set=[(X_te, y_te)] if len(X_te) > 0 else None,
             callbacks=[lgb.early_stopping(75, verbose=False), lgb.log_evaluation(0)]
             if len(X_te) > 0 else [lgb.log_evaluation(0)],
@@ -265,6 +285,8 @@ class PriceForecaster:
         meta = {
             "feature_cols": self._feature_cols,
             "lgb_params": self.lgb_params,
+            "peak_hours": list(self.peak_hours),
+            "peak_weight": self.peak_weight,
             "schema": "15min",
         }
         (d / "meta.json").write_text(json.dumps(meta, indent=2))
@@ -297,6 +319,8 @@ class PriceForecaster:
                 "Retrain with the current pipeline."
             )
         self._feature_cols = meta.get("feature_cols", [])
+        self.peak_hours = tuple(meta.get("peak_hours", self.peak_hours))
+        self.peak_weight = float(meta.get("peak_weight", self.peak_weight))
 
         with open(model_path, "rb") as fh:
             self._model = pickle.load(fh)
