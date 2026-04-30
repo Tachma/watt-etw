@@ -1,15 +1,11 @@
-import React, { useMemo, useState } from "react";
+import React, { useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
   BatteryCharging,
-  CalendarDays,
-  CheckCircle2,
-  FileUp,
-  Gauge,
+  MousePointer2,
   Play,
   Plus,
-  Trash2,
-  UploadCloud
+  Trash2
 } from "lucide-react";
 import "./styles.css";
 
@@ -38,49 +34,12 @@ const defaultBattery = (index = 1) => ({
   ramp: 25
 });
 
-const previewBars = [
-  34, 30, 28, 32, 39, 55, 72, 69, 58, 46, 42, 48,
-  61, 70, 74, 63, 52, 49, 57, 76, 82, 67, 50, 38
-];
-
 function App() {
   const [step, setStep] = useState("landing");
   const [batteries, setBatteries] = useState([defaultBattery()]);
-  const [validation, setValidation] = useState(null);
-  const [selectedDate, setSelectedDate] = useState("");
   const [result, setResult] = useState(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
-
-  const rows = validation?.rows || [];
-  const selectedRows = useMemo(() => {
-    if (!selectedDate) return rows;
-    return rows.filter((row) => row.timestamp.startsWith(selectedDate));
-  }, [rows, selectedDate]);
-
-  async function validateFile(file) {
-    setBusy(true);
-    setError("");
-    setValidation(null);
-    const formData = new FormData();
-    formData.append("file", file);
-    try {
-      const response = await fetch("/api/market-data/validate", {
-        method: "POST",
-        body: formData
-      });
-      const data = await parseJsonResponse(response, "Could not validate file");
-      if (!response.ok) throw new Error(data.detail || "Could not validate file.");
-      setValidation(data);
-      if (data.detected_dates?.length) {
-        setSelectedDate(data.detected_dates[0]);
-      }
-    } catch (err) {
-      setError(err.message || "Could not validate file.");
-    } finally {
-      setBusy(false);
-    }
-  }
 
   async function optimize() {
     setBusy(true);
@@ -90,36 +49,12 @@ function App() {
         normalizeBatteryPayload({ ...defaultBattery(index + 1), ...battery })
       );
 
-      // Extract prices from the uploaded market rows for the selected date
-      const sorted = [...selectedRows].sort((a, b) =>
-        a.timestamp < b.timestamp ? -1 : 1
-      );
-      const priceValues = sorted.map((r) => Number(r.price_eur_mwh));
-
-      // Determine resolution: 96 = 15-min, 24 = hourly, otherwise aggregate
-      let pricePayload;
-      if (priceValues.length === 96) {
-        pricePayload = { prices_15min: priceValues };
-      } else if (priceValues.length === 24) {
-        pricePayload = { prices_hourly: priceValues };
-      } else if (priceValues.length > 0) {
-        // Aggregate to 24 hourly by averaging groups
-        const perHour = Math.floor(priceValues.length / 24);
-        const hourly = Array.from({ length: 24 }, (_, h) => {
-          const chunk = priceValues.slice(h * perHour, (h + 1) * perHour);
-          return chunk.reduce((s, v) => s + v, 0) / chunk.length;
-        });
-        pricePayload = { prices_hourly: hourly };
-      } else {
-        throw new Error("No market data for the selected date.");
-      }
-
       const response = await fetch("/api/optimize-arbitrage", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           batteries: batteryPayload,
-          ...pricePayload
+          date: "2026-04-29"
         })
       });
       const data = await parseJsonResponse(response, "Optimization failed");
@@ -158,7 +93,6 @@ function App() {
         </div>
         <nav aria-label="Workflow">
           <button className={step === "fleet" ? "active" : ""} onClick={() => setStep("fleet")}>Fleet</button>
-          <button className={step === "import" ? "active" : ""} onClick={() => setStep("import")}>Import</button>
           <button className={step === "results" ? "active" : ""} disabled={!result} onClick={() => setStep("results")}>Results</button>
         </nav>
       </header>
@@ -194,37 +128,15 @@ function App() {
             ))}
           </div>
           <div className="actions">
-            <button className="primary" onClick={() => setStep("import")}>Continue to Data Import</button>
+            <button className="primary" disabled={busy} onClick={optimize}>
+              <Play size={18} /> {busy ? "Optimizing..." : "Optimize"}
+            </button>
           </div>
         </section>
       )}
 
-      {step === "import" && (
-        <section>
-          <p className="eyebrow">Step 2</p>
-          <h2>Import CSV/XLSX With DAM Data</h2>
-          <label className="dropzone">
-            <FileUp size={32} />
-            <strong>Upload HEnEx-style DAM data</strong>
-            <span>CSV or XLSX with market time and clearing price columns.</span>
-            <input type="file" accept=".csv,.xlsx,.xlsm" onChange={(event) => event.target.files?.[0] && validateFile(event.target.files[0])} />
-          </label>
-          {busy && <p>Processing...</p>}
-          {validation && (
-            <ValidationPreview
-              validation={validation}
-              selectedDate={selectedDate}
-              setSelectedDate={setSelectedDate}
-              selectedRows={selectedRows}
-              optimize={optimize}
-              busy={busy}
-            />
-          )}
-        </section>
-      )}
-
       {step === "results" && result && (
-        <Results result={result} rows={selectedRows} exportSchedule={exportSchedule} />
+        <Results result={result} rows={result.schedule || []} exportSchedule={exportSchedule} />
       )}
     </main>
   );
@@ -235,12 +147,16 @@ function Landing({ onStart }) {
     <section className="landing">
       <div className="hero">
         <div className="heroCopy">
-          <p className="eyebrow">Greek DAM battery arbitrage</p>
-          <h2>From HEnEx DAM prices to a battery dispatch schedule in minutes.</h2>
-          <p>
-            Configure a battery fleet, upload HEnEx-style market data, and calculate a feasible
-            charge/discharge plan with profit, cost, and SOC.
-          </p>
+          <h2>
+            A{" "}
+            <span className="cursorWord" aria-label="click">
+              <MousePointer2 className="cursorShadow" size={52} strokeWidth={2.55} />
+              <MousePointer2 className="cursorIcon cursorIconBack" size={48} strokeWidth={2.45} />
+              <MousePointer2 className="cursorIcon cursorIconFront" size={48} strokeWidth={2.45} />
+            </span>{" "}
+            Away From Battery Arbitrage
+          </h2>
+          <p className="heroTagline">Battery Arbitrage Workflow</p>
           <div className="heroActions">
             <button className="primary" onClick={onStart}>
               <Play size={18} /> Start Optimization
@@ -255,33 +171,14 @@ function Landing({ onStart }) {
 
 function MarketPreview() {
   return (
-    <div className="marketPreview" aria-label="Example optimization preview">
-      <div className="previewHeader">
-        <div>
-          <span>Optimization preview</span>
-          <strong>DAM price signal</strong>
-        </div>
-        <span className="liveTag">Ready</span>
+    <div className="marketPreview workflowPreview" aria-label="Top-down workflow">
+      <div className="workflowHead">
+        <strong>Battery Arbitrage Journey</strong>
       </div>
-      <div className="previewStats">
-        <span><Gauge size={16} /> Price spread <strong>54.2 EUR/MWh</strong></span>
-        <span><BatteryCharging size={16} /> Final SOC <strong>38 MWh</strong></span>
-      </div>
-      <div className="priceWindow">
-        {previewBars.map((value, index) => {
-          const action = index < 6 ? "charge" : index > 18 && index < 22 ? "discharge" : "";
-          return (
-            <span
-              className={`priceBar ${action}`}
-              key={`${value}-${index}`}
-              style={{ "--height": `${value}%` }}
-            />
-          );
-        })}
-      </div>
-      <div className="previewFooter">
-        <span><UploadCloud size={15} /> HEnEx-style upload</span>
-        <span><CalendarDays size={15} /> Daily schedule</span>
+      <div className="workflowStack" role="list">
+        <div className="workflowStep" role="listitem">Configure Battery Fleet</div>
+        <div className="workflowArrow" aria-hidden="true">↓</div>
+        <div className="workflowStep" role="listitem">Battery Arbitrage Results</div>
       </div>
     </div>
   );
@@ -335,38 +232,6 @@ function BatteryForm({ battery, onChange, onRemove, canRemove }) {
         ))}
       </div>
     </article>
-  );
-}
-
-function ValidationPreview({ validation, selectedDate, setSelectedDate, selectedRows, optimize, busy }) {
-  return (
-    <div className="panel wide">
-      <div className="statusLine">
-        <CheckCircle2 size={18} />
-        <strong>{validation.valid ? "Data validated" : "Validation failed"}</strong>
-        <span>{validation.row_count} rows</span>
-        <span>{validation.interval_minutes || "-"} min intervals</span>
-      </div>
-      {validation.errors?.map((item) => <p className="alert" key={item}>{item}</p>)}
-      {validation.warnings?.map((item) => <p className="warning" key={item}>{item}</p>)}
-      <div className="split">
-        <label>
-          <span>Delivery Day</span>
-          <select value={selectedDate} onChange={(e) => setSelectedDate(e.target.value)}>
-            {validation.detected_dates?.map((item) => <option key={item} value={item}>{item}</option>)}
-          </select>
-        </label>
-        <div className="miniStats">
-          <span>Min EUR/MWh <strong>{validation.price_summary?.min?.toFixed?.(2)}</strong></span>
-          <span>Avg EUR/MWh <strong>{validation.price_summary?.average?.toFixed?.(2)}</strong></span>
-          <span>Max EUR/MWh <strong>{validation.price_summary?.max?.toFixed?.(2)}</strong></span>
-        </div>
-      </div>
-      <Sparkline rows={selectedRows} />
-      <button className="primary" disabled={!validation.valid || busy} onClick={optimize}>
-        <Play size={18} /> Run Optimization
-      </button>
-    </div>
   );
 }
 
