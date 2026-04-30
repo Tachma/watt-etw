@@ -40,8 +40,9 @@ logger = logging.getLogger(__name__)
 sys.path.insert(0, str(Path(__file__).parent))
 
 # Data directories — adjust if your layout differs
-HENEX_DIRS = ["data/2024_DAM_data", "data/2025_DAM_data"]
+HENEX_DIRS = ["data/2024_DAM_data", "data/2025_DAM_data", "data/2026_DAM_data"]
 PRICES_CACHE = "data/processed/prices.parquet"   # parser appends "_15min"
+ENTSOE_PRICES_CACHE = Path("data/processed/prices_entsoe_2026.parquet")
 FEATURES_CACHE = "data/processed/features.parquet"
 MODEL_DIR = "models/price_forecaster"
 RAE_ASSETS_CACHE = Path("data/external/rae/assets.parquet")
@@ -139,11 +140,59 @@ def run(force: bool = False, eval_only: bool = False, use_rae: bool = True) -> N
         )
 
         start = prices["date"].min().date()
-        end = prices["date"].max().date()
+        end   = prices["date"].max().date()
         logger.info(
             "Price data: %s → %s (%d days, %d rows)",
             start, end, prices["date"].nunique(), len(prices),
         )
+
+        # ------------------------------------------------------------------ #
+        # 1b. Extend with ENTSO-E for any gap between last HENEX day and today #
+        # ------------------------------------------------------------------ #
+        import os
+        from datetime import date as _date
+        entsoe_token = os.environ.get("WATT_ENTSOE_TOKEN")
+        today = _date.today()
+        if entsoe_token and end < today:
+            entsoe_start = end + pd.Timedelta(days=1)
+            logger.info(
+                "Step 1b — ENTSO-E extension: %s → %s", entsoe_start.date(), today,
+            )
+            try:
+                from watt_etw.data.entsoe_fetcher import fetch as fetch_entsoe
+                if ENTSOE_PRICES_CACHE.exists() and not force:
+                    entsoe_df = pd.read_parquet(ENTSOE_PRICES_CACHE)
+                    logger.info(
+                        "Loaded ENTSO-E cache: %d rows (%s → %s)",
+                        len(entsoe_df),
+                        entsoe_df["date"].min().date(),
+                        entsoe_df["date"].max().date(),
+                    )
+                else:
+                    entsoe_df = fetch_entsoe(
+                        entsoe_start.date(), today, token=entsoe_token, force=force
+                    )
+                    ENTSOE_PRICES_CACHE.parent.mkdir(parents=True, exist_ok=True)
+                    entsoe_df.to_parquet(ENTSOE_PRICES_CACHE, index=False)
+                    logger.info("Cached ENTSO-E prices to %s", ENTSOE_PRICES_CACHE)
+                # Align columns with HENEX schema and concatenate
+                for col in prices.columns:
+                    if col not in entsoe_df.columns:
+                        entsoe_df[col] = None
+                prices = pd.concat(
+                    [prices, entsoe_df[prices.columns]], ignore_index=True
+                ).drop_duplicates(["date", "mtu"]).sort_values(["date", "mtu"])
+                end = prices["date"].max().date()
+                logger.info(
+                    "Combined price data: %s → %s (%d days, %d rows)",
+                    start, end, prices["date"].nunique(), len(prices),
+                )
+            except Exception as exc:
+                logger.warning("ENTSO-E extension failed (%s) — using HENEX only", exc)
+        elif not entsoe_token and end < today:
+            logger.info(
+                "No ENTSO-E token — set WATT_ENTSOE_TOKEN to extend past %s", end,
+            )
 
         logger.info("Step 2/7 — Loading TTF gas prices")
         ttf = load_ttf(start, end)
