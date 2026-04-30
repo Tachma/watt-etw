@@ -112,7 +112,7 @@ def _top_by_capacity(assets_df: pd.DataFrame, top_n: int | None) -> pd.DataFrame
 # Main                                                                          #
 # --------------------------------------------------------------------------- #
 
-def run(force: bool = False, eval_only: bool = False, use_rae: bool = True) -> None:
+def run(force: bool = False, eval_only: bool = False, use_rae: bool = True, build_features_only: bool = False) -> None:
     from watt_etw.data.henex_parser import load_or_parse
     from watt_etw.data.ttf_fetcher import load as load_ttf
     from watt_etw.data.weather_fetcher import (
@@ -127,7 +127,9 @@ def run(force: bool = False, eval_only: bool = False, use_rae: bool = True) -> N
     # ------------------------------------------------------------------ #
     # 1. Load or rebuild features                                          #
     # ------------------------------------------------------------------ #
-    if eval_only and Path(FEATURES_CACHE).exists():
+    if build_features_only:
+        force = True  # always rebuild when this flag is set
+    if eval_only and not build_features_only and Path(FEATURES_CACHE).exists():
         logger.info("Loading features from cache (eval-only mode)")
         features = pd.read_parquet(FEATURES_CACHE)
     else:
@@ -244,6 +246,10 @@ def run(force: bool = False, eval_only: bool = False, use_rae: bool = True) -> N
         len(features), len(features.columns),
     )
 
+    if build_features_only:
+        logger.info("Feature cache rebuilt. Skipping training (--build-features-only).")
+        return
+
     # ------------------------------------------------------------------ #
     # 2. Train or evaluate                                                 #
     # ------------------------------------------------------------------ #
@@ -298,5 +304,8 @@ if __name__ == "__main__":
                         help="Skip training; load saved model and print metrics")
     parser.add_argument("--no-rae", action="store_true",
                         help="Skip RAE per-tech RES weather (faster, less detail)")
+    parser.add_argument("--build-features-only", action="store_true",
+                        help="Rebuild feature cache only; skip training (use saved model)")
     args = parser.parse_args()
-    run(force=args.force, eval_only=args.eval_only, use_rae=not args.no_rae)
+    run(force=args.force, eval_only=args.eval_only, use_rae=not args.no_rae,
+        build_features_only=args.build_features_only)
