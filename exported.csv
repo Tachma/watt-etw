@@ -1,0 +1,4 @@
+timestamp,price_eur_mwh,action,charge_mw,discharge_mw,soc_mwh,interval_hours,explanation
+00:00,116.51,hold,0.0,0.0,25.0,,Holding
+00:15,116.51,charge,22.4342,0.0,30.320729,,Charging at 116.51 EUR/MWh
+00:30,116.51,charge,47.4342,0.0,41.570729,,Charging at 116.51 EUR/MWh

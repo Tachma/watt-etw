@@ -30,7 +30,7 @@ React UI
   -> user uploads CSV/XLSX DAM file
   -> POST /api/market-data/validate
   -> backend parses and validates market rows
-  -> user selects delivery date
+  -> user selects delivery datemade by ribbon X discharge
   -> POST /api/optimize
   -> backend aggregates fleet and runs optimizer
   -> React shows KPIs, charts, schedule, explanations

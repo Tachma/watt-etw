@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import io
 import logging
+import math
 from datetime import date
 from functools import lru_cache
 from pathlib import Path
@@ -13,10 +14,12 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from watt_etw.battery_fleet import BatterySpec, aggregate_fleet
+from watt_etw.economics import EconomicsInputs, compute_economics
 from watt_etw.market_import import filter_rows_for_date, load_market_file, rows_from_payload
 from watt_etw.milp_optimizer import (
     DT,
     NUM_INTERVALS,
+    NUM_QUARTERS,
     hourly_to_quarterly,
     optimize_fleet,
 )
@@ -54,12 +57,39 @@ class ArbitrageRequest(BaseModel):
     # Option A: supply prices explicitly
     prices_15min: list[float] | None = None   # 96 quarter-hour prices EUR/MWh
     prices_hourly: list[float] | None = None  # 24 hourly prices EUR/MWh (repeated x4)
-    # Option B: let the ML forecaster produce prices
+    # Option B: let the ML forecaster produce 96 quarter-hour prices
     date: str | None = None                   # ISO format YYYY-MM-DD
 
 
 class ExportRequest(BaseModel):
     schedule: list[dict]
+
+
+class EconomicsRequest(BaseModel):
+    energy_capacity_mwh: float
+    power_capacity_mw: float
+    daily_revenue_eur: float
+    daily_throughput_mwh: float
+
+    realization_ratio: float = 0.75
+    availability: float = 0.97
+    operating_days_per_year: int = 365
+    annual_degradation: float = 0.02
+
+    capex_per_mwh_energy: float = 300_000.0
+    capex_per_mw_power: float = 0.0
+    grid_connection_eur: float = 0.0
+    grant_eur: float = 0.0
+
+    opex_fixed_pct: float = 0.02
+    opex_var_eur_per_mwh: float = 2.0
+    augmentation_pct: float = 0.012
+
+    wacc: float = 0.08
+    lifetime_years: int = 12
+    salvage_pct: float = 0.07
+    tax_rate: float = 0.24
+    depreciation_years: int = 10
 
 
 @app.get("/api/health")
@@ -94,11 +124,12 @@ def optimize_arbitrage(payload: ArbitrageRequest) -> dict:
     Price resolution priority:
       1. prices_15min  (96 explicit quarter-hour prices)
       2. prices_hourly (24 explicit hourly prices, repeated x4)
-      3. date          (ML forecaster → 24 hourly prices, repeated x4)
+      3. date          (ML forecaster → 96 quarter-hour prices)
     """
     try:
         specs = [BatterySpec.from_dict(item) for item in payload.batteries]
         fleet = aggregate_fleet(specs)
+        actual_prices = _actual_prices_for_date(payload.date) if payload.date else None
 
         if payload.prices_15min is not None:
             if len(payload.prices_15min) != NUM_INTERVALS:
@@ -112,7 +143,7 @@ def optimize_arbitrage(payload: ArbitrageRequest) -> dict:
             prices = hourly_to_quarterly(payload.prices_hourly)
 
         elif payload.date is not None:
-            prices = hourly_to_quarterly(_forecast_for_date(payload.date))
+            prices = _forecast_for_date(payload.date)
 
         else:
             raise ValueError(
@@ -124,7 +155,7 @@ def optimize_arbitrage(payload: ArbitrageRequest) -> dict:
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    return _milp_to_frontend(result, fleet)
+    return _milp_to_frontend(result, fleet, actual_prices=actual_prices)
 
 
 @app.get("/api/forecast/{target_date}")
@@ -134,8 +165,8 @@ def get_forecast(target_date: str) -> dict:
     Response includes 24 hourly prices and 96 derived quarter-hour prices.
     """
     try:
-        hourly = _forecast_for_date(target_date)
-        quarterly = hourly_to_quarterly(hourly)
+        quarterly = _forecast_for_date(target_date)
+        hourly = _hourly_average_from_quarterly(quarterly)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {
@@ -143,6 +174,23 @@ def get_forecast(target_date: str) -> dict:
         "hourly_eur_mwh": [round(p, 4) for p in hourly],
         "quarterly_eur_mwh": [round(p, 4) for p in quarterly],
     }
+
+
+@app.post("/api/economics")
+def economics(payload: EconomicsRequest) -> dict:
+    """Investment economics for a battery project (CAPEX, NPV, IRR, payback).
+
+    `daily_revenue_eur` and `daily_throughput_mwh` should come from the
+    optimizer's KPIs (`expected_profit` and `total_discharged_mwh`). The
+    response includes the year-by-year cash flows plus headline metrics and
+    a `verdict` of `worth_it`, `marginal`, or `burning_money`.
+    """
+    try:
+        inputs = EconomicsInputs(**payload.model_dump())
+        result = compute_economics(inputs)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return result.to_dict()
 
 
 @app.post("/api/export-schedule")
@@ -154,7 +202,6 @@ def export_schedule(payload: ExportRequest) -> StreamingResponse:
         "action",
         "charge_mw",
         "discharge_mw",
-        "soc_mwh",
         "interval_hours",
         "explanation",
     ]
@@ -174,7 +221,7 @@ def export_schedule(payload: ExportRequest) -> StreamingResponse:
 # Response adapter  (MILP → frontend Results component format)
 # ---------------------------------------------------------------------------
 
-def _milp_to_frontend(result, fleet) -> dict:
+def _milp_to_frontend(result, fleet, actual_prices: list[float] | None = None) -> dict:
     """Convert ArbitrageResult to the shape the Results component expects."""
     discharge_revenue = 0.0
     charging_cost = 0.0
@@ -202,7 +249,8 @@ def _milp_to_frontend(result, fleet) -> dict:
         minutes = (row.hour - 1) * 60 + (row.quarter - 1) * 15
         ts = f"{minutes // 60:02d}:{minutes % 60:02d}"
 
-        schedule_rows.append({
+        interval_index = (row.hour - 1) * NUM_QUARTERS + (row.quarter - 1)
+        schedule_row = {
             "timestamp": ts,
             "hour": row.hour,
             "quarter": row.quarter,
@@ -212,7 +260,11 @@ def _milp_to_frontend(result, fleet) -> dict:
             "discharge_mw": discharge_mw,
             "soc_mwh": row.soc_mwh,
             "explanation": explanation,
-        })
+        }
+        if actual_prices is not None and interval_index < len(actual_prices):
+            schedule_row["actual_price_eur_mwh"] = round(actual_prices[interval_index], 4)
+
+        schedule_rows.append(schedule_row)
 
     usable_capacity = fleet.max_soc_mwh - fleet.min_soc_mwh
     equiv_cycles = round(
@@ -250,7 +302,7 @@ def _load_forecaster():
 
 
 def _forecast_for_date(target_date_str: str) -> list[float]:
-    """Return 24 hourly predicted prices for a given date string."""
+    """Return 96 quarter-hour predicted prices for a given date string."""
     import pandas as pd
 
     target = date.fromisoformat(target_date_str)
@@ -272,13 +324,60 @@ def _forecast_for_date(target_date_str: str) -> list[float]:
     day_features = features[features["date"] == target_ts]
 
     if day_features.empty:
-        # Outside training window: use last 24 rows, override calendar columns
-        day_features = features.iloc[-24:].copy()
+        # Outside training window: use the last full 96-MTU shape, override
+        # known calendar/index columns, and keep lag/exogenous columns as the
+        # latest available proxy.
+        day_features = features.iloc[-NUM_INTERVALS:].copy()
+        if len(day_features) != NUM_INTERVALS:
+            raise RuntimeError(
+                f"Need at least {NUM_INTERVALS} cached feature rows to forecast "
+                f"{target_date_str}; found {len(features)}."
+            )
+        day_features = day_features.reset_index(drop=True)
+        day_features["mtu"] = range(NUM_INTERVALS)
+        day_features["hour"] = day_features["mtu"] // 4
+        day_features["quarter"] = day_features["mtu"] % 4
+        day_features["hour_of_day"] = day_features["hour"]
+        day_features["quarter_of_hour"] = day_features["quarter"]
+        day_features["mtu_of_day"] = day_features["mtu"]
         day_features["date"] = target_ts
         day_features["day_of_week"] = target.weekday()
         day_features["month"] = target.month
         day_features["is_weekend"] = int(target.weekday() >= 5)
 
     result = forecaster.predict(day_features, target)
-    # predictions is dict {hour: price}; return as ordered list [h0..h23]
-    return [result.predictions.get(h, float("nan")) for h in range(24)]
+    # predictions is dict {mtu: price}; return as ordered list [mtu0..mtu95]
+    return [result.predictions.get(mtu, float("nan")) for mtu in range(NUM_INTERVALS)]
+
+
+@lru_cache(maxsize=128)
+def _actual_prices_for_date(target_date_str: str) -> list[float] | None:
+    """Return actual cached DAM/MCP prices for a date, if all 96 MTUs exist."""
+    import pandas as pd
+
+    target = date.fromisoformat(target_date_str)
+    if not _FEATURES_CACHE.exists():
+        return None
+
+    features = pd.read_parquet(_FEATURES_CACHE, columns=["date", "mtu", "mcp_eur_mwh"])
+    features["date"] = pd.to_datetime(features["date"])
+    day = features[features["date"] == pd.Timestamp(target)].sort_values("mtu")
+    if len(day) != NUM_INTERVALS:
+        return None
+
+    prices = [float(value) for value in day["mcp_eur_mwh"].tolist()]
+    if any(not math.isfinite(value) for value in prices):
+        return None
+    return prices
+
+
+def _hourly_average_from_quarterly(prices_15min: list[float]) -> list[float]:
+    """Average 96 quarter-hour prices into 24 hourly values for API display."""
+    if len(prices_15min) != NUM_INTERVALS:
+        raise ValueError(
+            f"Expected {NUM_INTERVALS} quarter-hour prices, got {len(prices_15min)}"
+        )
+    return [
+        sum(prices_15min[start:start + 4]) / 4
+        for start in range(0, NUM_INTERVALS, 4)
+    ]

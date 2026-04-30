@@ -347,6 +347,33 @@ h3 {
 .sectionHead h2 {
   margin: 4px 0 0;
 }
+.resultTabs {
+  display: inline-flex;
+  gap: 6px;
+  padding: 4px;
+  margin: 0 0 16px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface);
+}
+.resultTabs button {
+  min-width: 138px;
+  border-color: transparent;
+  background: transparent;
+}
+.resultTabs button.active {
+  background: var(--blue);
+  border-color: var(--blue);
+  color: #fff;
+}
+.chartStack {
+  display: grid;
+  gap: 16px;
+}
+.bidStack {
+  display: grid;
+  gap: 16px;
+}
 .batteryGrid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
@@ -463,11 +490,143 @@ select:focus {
   border-radius: 4px;
   padding: 10px;
 }
+.chartViewport {
+  overflow-x: auto;
+  padding-bottom: 2px;
+}
+.chartTrack {
+  min-width: 720px;
+  padding-left: 56px;
+  position: relative;
+}
+.chartArea {
+  position: relative;
+}
+.priceAxis {
+  position: absolute;
+  top: 10px;
+  left: -56px;
+  right: 0;
+  height: 180px;
+  pointer-events: none;
+  z-index: 1;
+}
+.priceTick {
+  position: absolute;
+  left: 0;
+  right: 0;
+  display: flex;
+  align-items: center;
+  transform: translateY(-50%);
+}
+.priceLabel {
+  display: inline-block;
+  width: 50px;
+  text-align: right;
+  padding-right: 8px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 800;
+  flex-shrink: 0;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.01em;
+}
+.priceGridline {
+  flex: 1;
+  height: 0;
+  border-top: 1px dashed var(--line);
+}
+.priceTick:first-child .priceGridline,
+.priceTick:last-child .priceGridline {
+  border-top-style: solid;
+  border-top-color: var(--line-strong);
+}
+.chartLineWrap {
+  position: relative;
+  margin-top: 10px;
+  height: 180px;
+  cursor: crosshair;
+}
+.chartLineWrap > .lineChart {
+  margin: 0;
+  height: 100%;
+  background: linear-gradient(to bottom, rgba(61,165,244,0.04), rgba(61,165,244,0));
+}
+.crosshairVert {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: var(--line-strong);
+  pointer-events: none;
+  z-index: 2;
+  transform: translateX(-50%);
+}
+.crosshairDot {
+  position: absolute;
+  width: 11px;
+  height: 11px;
+  border-radius: 50%;
+  background: var(--blue);
+  border: 2px solid #fff;
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+  z-index: 3;
+  box-shadow: 0 2px 6px rgba(31, 35, 80, 0.25);
+}
+.crosshairTip {
+  position: absolute;
+  background: var(--ink);
+  color: #fff;
+  padding: 8px 12px;
+  border-radius: 5px;
+  font-weight: 700;
+  font-size: 12px;
+  white-space: nowrap;
+  pointer-events: none;
+  z-index: 4;
+  box-shadow: 0 8px 20px rgba(31, 35, 80, 0.25);
+  font-variant-numeric: tabular-nums;
+}
+.crosshairTip strong {
+  display: block;
+  font-weight: 900;
+  font-size: 15px;
+  letter-spacing: 0.01em;
+}
+.crosshairTip span {
+  display: block;
+  font-weight: 600;
+  font-size: 11px;
+  margin-top: 2px;
+  color: rgba(255, 255, 255, 0.75);
+}
+.tipRight {
+  transform: translate(14px, -50%);
+}
+.tipLeft {
+  transform: translate(calc(-100% - 14px), -50%);
+}
+.crosshairTip::before {
+  content: "";
+  position: absolute;
+  top: 50%;
+  width: 8px;
+  height: 8px;
+  background: var(--ink);
+  transform: translateY(-50%) rotate(45deg);
+}
+.tipRight::before {
+  left: -3px;
+}
+.tipLeft::before {
+  right: -3px;
+}
 .lineChart {
   width: 100%;
   height: 180px;
   display: block;
-  margin: 14px 0;
+  margin: 10px 0 0;
   background: var(--surface-soft);
   border-radius: 4px;
 }
@@ -475,6 +634,289 @@ select:focus {
   height: 180px;
   background: var(--surface-soft);
   border-radius: 4px;
+}
+.timeAxis {
+  display: grid;
+  grid-template-columns: repeat(24, minmax(0, 1fr));
+  border-top: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 800;
+  line-height: 1;
+  margin-top: 7px;
+  padding-top: 5px;
+}
+.timeAxis span {
+  display: grid;
+  justify-items: center;
+  gap: 4px;
+  white-space: nowrap;
+}
+.timeAxis span::before {
+  content: "";
+  width: 1px;
+  height: 6px;
+  background: var(--line-strong);
+}
+.signalExplanation p {
+  color: var(--ink);
+  font-size: 15px;
+  font-weight: 750;
+  line-height: 1.62;
+  margin: 14px 0 0;
+}
+.explanationText strong {
+  font-weight: 900;
+}
+.toneCursor {
+  color: transparent;
+  background: linear-gradient(115deg, var(--blue) 0%, var(--green) 52%, var(--blue) 100%);
+  background-clip: text;
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  text-shadow: 0 3px 12px rgba(61, 165, 244, 0.16);
+}
+.toneViolet {
+  color: var(--violet);
+}
+.toneGreen {
+  color: #257544;
+}
+.explanationGrid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 12px;
+}
+.explanationGrid div {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface-soft);
+  padding: 12px;
+}
+.explanationGrid span,
+.explanationGrid small {
+  display: block;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 800;
+}
+.explanationGrid strong {
+  display: block;
+  margin: 7px 0 4px;
+  color: var(--ink);
+  font-size: 18px;
+  line-height: 1.16;
+}
+.economicGrid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 12px;
+}
+.economicFigure {
+  min-height: 96px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface-soft);
+  padding: 14px;
+}
+.economicFigure span {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+}
+.economicFigure strong {
+  display: block;
+  margin-top: 10px;
+  color: var(--ink);
+  font-size: 25px;
+  line-height: 1.1;
+}
+.formulaGrid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 12px;
+}
+.formulaGrid div {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface-soft);
+  padding: 12px;
+}
+.formulaGrid span {
+  display: block;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 800;
+}
+.formulaGrid strong {
+  display: block;
+  margin-top: 8px;
+  color: var(--violet);
+  font-size: 13px;
+  line-height: 1.3;
+}
+.bidNote {
+  color: var(--muted);
+  font-size: 14px;
+  font-weight: 700;
+  line-height: 1.6;
+  margin: 14px 0 0;
+}
+.tableScroller {
+  overflow-x: auto;
+}
+.cashPositive {
+  color: #257544;
+  font-weight: 800;
+}
+.cashNegative {
+  color: var(--violet);
+  font-weight: 800;
+}
+.verdictRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  flex-wrap: wrap;
+  margin-bottom: 6px;
+}
+.verdictBlurb {
+  text-align: right;
+}
+.verdictBlurb span {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+  display: block;
+}
+.verdictBlurb strong {
+  display: block;
+  margin-top: 4px;
+  font-size: 28px;
+  line-height: 1.1;
+}
+.verdictBadge {
+  display: inline-flex;
+  align-items: center;
+  padding: 12px 22px;
+  border-radius: 999px;
+  font-weight: 800;
+  font-size: 18px;
+  letter-spacing: 0.02em;
+  border: 1px solid var(--line);
+}
+.verdictGood {
+  background: #d8f6e1;
+  color: #156a32;
+  border-color: #8fdca6;
+}
+.verdictAmber {
+  background: #fff1d2;
+  color: #8a5a05;
+  border-color: #f0c878;
+}
+.verdictBad {
+  background: #f8dadf;
+  color: #8c2230;
+  border-color: #e89aa6;
+}
+.toneRose {
+  color: var(--violet);
+}
+.economicsForm {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+.breakdownBlock {
+  margin-top: 18px;
+  padding: 14px 16px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface-soft);
+}
+.breakdownBlock:first-of-type {
+  margin-top: 14px;
+}
+.breakdownTitle {
+  font-weight: 800;
+  font-size: 14px;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  color: var(--violet);
+  margin-bottom: 10px;
+}
+.breakdownLine {
+  display: grid;
+  grid-template-columns: 1fr minmax(140px, max-content);
+  gap: 18px;
+  align-items: baseline;
+  padding: 7px 0;
+  border-bottom: 1px dashed var(--line);
+  font-variant-numeric: tabular-nums;
+}
+.breakdownLine:last-child {
+  border-bottom: none;
+}
+.breakdownLabel {
+  color: var(--ink);
+  font-size: 13.5px;
+  font-weight: 600;
+}
+.breakdownValue {
+  text-align: right;
+  font-weight: 800;
+  font-size: 14px;
+  color: var(--ink);
+}
+.breakdownMuted .breakdownLabel,
+.breakdownMuted .breakdownValue {
+  color: var(--muted);
+  font-weight: 600;
+}
+.breakdownTotal {
+  margin-top: 6px;
+  padding-top: 11px;
+  border-top: 2px solid var(--line-strong);
+  border-bottom: none !important;
+}
+.breakdownTotal .breakdownLabel,
+.breakdownTotal .breakdownValue {
+  font-size: 16px;
+  font-weight: 900;
+}
+.breakdownTotalNote {
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+  text-align: right;
+}
+.breakdownBullets {
+  margin: 0 0 10px;
+  padding-left: 18px;
+  color: var(--ink);
+  font-size: 13.5px;
+  font-weight: 600;
+  line-height: 1.65;
+}
+.breakdownBullets li {
+  margin-bottom: 2px;
+}
+.breakdownNote {
+  color: var(--muted);
+  font-size: 12.5px;
+  font-weight: 600;
+  margin-top: 8px;
+  line-height: 1.55;
+}
+.toneGreen .breakdownValue { color: #257544; }
+.toneRose .breakdownValue { color: var(--violet); }
+@media (max-width: 900px) {
+  .economicsForm { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .verdictBlurb { text-align: left; }
 }
 .kpis {
   display: grid;
@@ -500,7 +942,7 @@ select:focus {
 }
 .charts {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 16px;
 }
 .bars {
@@ -523,6 +965,11 @@ select:focus {
 }
 .bar.discharge {
   background: var(--green);
+}
+.bar.barHighlight {
+  outline: 2px solid var(--ink);
+  outline-offset: 1px;
+  z-index: 1;
 }
 table {
   width: 100%;
@@ -587,8 +1034,18 @@ th {
   }
   .split,
   .charts,
-  .kpis {
+  .kpis,
+  .economicGrid,
+  .explanationGrid,
+  .formulaGrid {
     grid-template-columns: 1fr;
+  }
+  .resultTabs {
+    width: 100%;
+  }
+  .resultTabs button {
+    flex: 1;
+    min-width: 0;
   }
   section {
     padding: 18px;
