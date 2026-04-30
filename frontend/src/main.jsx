@@ -335,7 +335,7 @@ function Results({ result, rows, exportSchedule, econ }) {
           aria-selected={activeTab === "dashboard"}
           onClick={() => setActiveTab("dashboard")}
         >
-          Economics & Dashboard
+          Economics
         </button>
         <button
           className={activeTab === "bidding" ? "active" : ""}
