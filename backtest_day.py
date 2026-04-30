@@ -173,20 +173,31 @@ def main() -> None:
     print(f"  Revenue (actual  prices)   : {actual_revenue_reeval:+.2f} EUR")
 
     # ------------------------------------------------------------------ #
-    # 7. Print schedule                                                    #
+    # 7. Print schedule with per-interval price comparison                 #
     # ------------------------------------------------------------------ #
-    print(f"\n{'-'*58}")
-    print(f"  {'Time':>5}  {'Pred €':>7}  {'Real €':>7}  {'Action':>10}  "
-          f"{'Chg MW':>7}  {'Dis MW':>7}  {'SOC MWh':>8}")
-    print(f"{'-'*58}")
+    print(f"\n{'-'*76}")
+    print(f"  {'Time':>5}  {'Pred':>7}  {'Actual':>7}  {'Err':>6}  {'Action':>10}  "
+          f"{'ChgMW':>6}  {'DisMW':>6}  {'SOCMWh':>7}")
+    print(f"{'-'*76}")
 
+    total_abs_err = 0.0
+    n_err = 0
     for row in opt.schedule:
         idx = (row.hour - 1) * 4 + (row.quarter - 1)
         h   = (idx * 15) // 60
         m   = (idx * 15) % 60
         ts  = f"{h:02d}:{m:02d}"
         ap  = actual_arr[idx]
-        ap_str = f"{ap:7.2f}" if not np.isnan(ap) else "    n/a"
+
+        if not np.isnan(ap):
+            err = row.lambda_eur_mwh - ap
+            err_str = f"{err:+6.2f}"
+            total_abs_err += abs(err)
+            n_err += 1
+            ap_str = f"{ap:7.2f}"
+        else:
+            err_str = "   n/a"
+            ap_str  = "    n/a"
 
         charge_mw    = round(row.charge_mwh / 0.25, 2)
         discharge_mw = round(row.discharge_mwh / 0.25, 2)
@@ -198,13 +209,20 @@ def main() -> None:
         else:
             action = "hold"
 
-        print(f"  {ts:>5}  {row.lambda_eur_mwh:7.2f}  {ap_str}  "
-              f"{action:>10}  {charge_mw:7.2f}  {discharge_mw:7.2f}  {row.soc_mwh:8.2f}")
+        print(f"  {ts:>5}  {row.lambda_eur_mwh:7.2f}  {ap_str}  {err_str}  "
+              f"{action:>10}  {charge_mw:6.2f}  {discharge_mw:6.2f}  {row.soc_mwh:7.2f}")
 
-    print(f"{'-'*58}")
+    print(f"{'-'*76}")
+    if n_err:
+        print(f"  Mean abs forecast error (all 96 MTUs): {total_abs_err/n_err:.2f} EUR/MWh")
     print(f"  KPIs  total charged   : {opt.kpis['total_charged_mwh']:.2f} MWh")
     print(f"        total discharged: {opt.kpis['total_discharged_mwh']:.2f} MWh")
     print(f"        final SOC       : {opt.kpis['final_soc_mwh']:.2f} MWh")
+    print(f"\n  Battery spec (user-defined defaults — set via --capacity / --ramp etc.):")
+    print(f"    Capacity  : {args.capacity} MWh")
+    print(f"    Ramp      : {args.ramp} MW")
+    print(f"    Efficiency: {args.efficiency:.0%} round-trip")
+    print(f"    Min SOC   : {args.min_capacity} MWh")
 
 
 if __name__ == "__main__":
